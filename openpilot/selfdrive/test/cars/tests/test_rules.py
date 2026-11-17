@@ -92,6 +92,14 @@ class TestRules(unittest.TestCase):
     msgs = [panda_state(0., False), selfdrive_state(0., False), panda_state(1., True), selfdrive_state(3.5, False)]
     self.assertIn("no onroadEvents recorded", failures(msgs)[0])
 
+  def test_warmup(self):
+    # openpilot doesn't engage on either edge, only the one after the warmup is judged
+    msgs = [panda_state(0., False), selfdrive_state(0., False), panda_state(1., True), panda_state(2., False)]
+    msgs += [panda_state(5., True), selfdrive_state(7.5, False)]
+    result = rule_failures(msgs, TOYOTA, 0, warmup=4.)
+    assert len(result) == 1
+    assert result[0].startswith("t=5.00 not engaged")
+
   def test_blocked_while_engaged(self):
     msgs = clean_drive()
     msgs.append(can_msg('can', 3.05, [(0x100, 192)]))

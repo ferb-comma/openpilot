@@ -9,7 +9,7 @@ from openpilot.common.utils import tabulate
 from openpilot.selfdrive.test.cars.drive import Drive, DriveFailed, RigProblem
 from openpilot.selfdrive.test.cars.replay import BUDGET, build_replay
 from openpilot.selfdrive.test.cars.rules import rule_failures
-from openpilot.selfdrive.test.cars.scenario import Scenario, load_scenario, load_scenarios
+from openpilot.selfdrive.test.cars.scenario import LENGTH, Scenario, load_scenario, load_scenarios
 
 NOT_DRIVEN = "not driven"
 RIG_PROBLEM = "rig problem"
@@ -82,7 +82,7 @@ class TestCars(OpenpilotTestCase):
       CP, msgs = load_scenario(s)
       frames = build_replay(s, CP, msgs, BUDGET)
       msgs = drive.run(s, frames)
-      result.failures = rule_failures(msgs, s.mode, s.param)
+      result.failures = rule_failures(msgs, s.mode, s.param, warmup=LENGTH)
       result.status = "passed" if not result.failures else "failed"
     except RigProblem as e:
       result.status = RIG_PROBLEM

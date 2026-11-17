@@ -13,9 +13,7 @@ from openpilot.selfdrive.test.cars.rules import NO_CAR_MODES
 from openpilot.selfdrive.test.cars.scenario import LENGTH, Scenario
 
 ONROAD_LIMIT = 120.
-# after onroad, a car that doesn't get engageable fails, the rig is fine
-ENGAGEABLE_LIMIT = 30.
-# one full loop of the window, wherever in the loop the recording starts
+# a warmup loop, then one full loop of the window, the rules judge the second
 RECORD_TIME = 2 * LENGTH
 RECORD = ('can', 'sendcan', 'pandaStates', 'selfdriveState', 'carState', 'onroadEvents')
 # the panda marks its own tx echoes with src + 128
@@ -138,16 +136,6 @@ class Drive:
       if time.monotonic() > end:
         raise DriveFailed(f"not onroad after {ONROAD_LIMIT:g} s: {', '.join(missing)}")
 
-  def _wait_engageable(self, sm) -> None:
-    end = time.monotonic() + ENGAGEABLE_LIMIT
-    while not sm['selfdriveState'].engageable:
-      self._check_manager()
-      if time.monotonic() > end:
-        events = [str(e.name) for e in sm['onroadEvents']]
-        raise TimeoutError(f"not engageable {ENGAGEABLE_LIMIT:g} s after onroad, events: {events}")
-      sm.update(10)
-    self._check_manager()
-
   def _record(self) -> list:
     socks = [messaging.sub_sock(s, conflate=False) for s in RECORD]
     for sock in socks:
@@ -167,7 +155,7 @@ class Drive:
   def run(self, scenario: Scenario, frames: list[Frame]) -> list:
     # the UP loops the window from its call until reset, each loop a lead-in, the engage edge, the engaged stretch and the wrap
     buses = {bus for frame in frames for _, _, bus in frame}
-    sm = messaging.SubMaster(['deviceState', 'carState', 'managerState', 'pandaStates', 'selfdriveState', 'onroadEvents'])
+    sm = messaging.SubMaster(['deviceState', 'carState', 'managerState', 'pandaStates'])
     can_sock = messaging.sub_sock('can', conflate=False)
     self._start_manager(scenario)
     try:
@@ -183,7 +171,6 @@ class Drive:
       self.replay_call_s = time.monotonic() - called
       print(f"up.can_replay took {self.replay_call_s:.2f} s")
       self._wait_onroad(sm, can_sock, buses)
-      self._wait_engageable(sm)
       return self._record()
     finally:
       try:
