@@ -26,6 +26,10 @@ class RigProblem(Exception):
   pass
 
 
+class DriveFailed(Exception):
+  pass
+
+
 def onroad_missing(sm) -> list[str]:
   # what keeps openpilot from being onroad, empty once it is
   missing = []
@@ -48,19 +52,8 @@ def fd_buses(frames: list[Frame]) -> list[int]:
   return sorted({bus for frame in frames for _, dat, bus in frame if len(dat) > 8})
 
 
-def manager_died(rc: int) -> RuntimeError:
-  return RuntimeError(f"manager died: rc {rc}")
-
-
-def onroad_timeout(rc: int | None, panda_seen: bool, quiet_buses: set[int], missing: list[str]) -> Exception:
-  # never onroad is the rack's problem only while openpilot is still running
-  if rc is not None:
-    return manager_died(rc)
-  if not panda_seen:
-    return RigProblem("rig problem: panda not answering")
-  if quiet_buses:
-    return RigProblem(f"rig problem: no CAN on bus {sorted(quiet_buses)}")
-  return RigProblem(f"rig problem: not onroad after {ONROAD_LIMIT:g} s: {', '.join(missing)}")
+def manager_died(rc: int) -> DriveFailed:
+  return DriveFailed(f"manager died: rc {rc}")
 
 
 def _signal_group(pgid: int, sig: signal.Signals) -> None:
@@ -131,22 +124,19 @@ class Drive:
 
   def _wait_onroad(self, sm, can_sock, buses: set[int]) -> None:
     seen: set[int] = set()
-    panda_seen = False
     end = time.monotonic() + ONROAD_LIMIT
     while True:
       self._check_manager()
       sm.update(10)
       for m in messaging.drain_sock(can_sock):
         seen |= {c.src for c in m.can if c.src < ECHO}
-      panda_seen = panda_seen or len(sm['pandaStates']) > 0
       missing = onroad_missing(sm)
+      if buses - seen:
+        missing.append(f"no CAN on bus {sorted(buses - seen)}")
       if not missing:
-        break
+        return
       if time.monotonic() > end:
-        assert self._manager is not None
-        raise onroad_timeout(self._manager.poll(), panda_seen, buses - seen, missing)
-    if buses - seen:
-      raise RigProblem(f"rig problem: no CAN on bus {sorted(buses - seen)}")
+        raise DriveFailed(f"not onroad after {ONROAD_LIMIT:g} s: {', '.join(missing)}")
 
   def _wait_engageable(self, sm) -> None:
     end = time.monotonic() + ENGAGEABLE_LIMIT

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.common.utils import tabulate
-from openpilot.selfdrive.test.cars.drive import Drive, RigProblem
+from openpilot.selfdrive.test.cars.drive import Drive, DriveFailed, RigProblem
 from openpilot.selfdrive.test.cars.replay import BUDGET, build_replay
 from openpilot.selfdrive.test.cars.rules import rule_failures
 from openpilot.selfdrive.test.cars.scenario import Scenario, load_scenario, load_scenarios
@@ -86,6 +86,9 @@ class TestCars(OpenpilotTestCase):
       result.status = "passed" if not result.failures else "failed"
     except RigProblem as e:
       result.status = RIG_PROBLEM
+      result.error = str(e)
+    except DriveFailed as e:
+      result.status = "failed"
       result.error = str(e)
     except Exception as e:
       result.status = "failed"
