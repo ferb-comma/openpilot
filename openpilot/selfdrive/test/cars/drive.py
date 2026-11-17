@@ -43,6 +43,11 @@ def onroad_missing(sm) -> list[str]:
   return missing
 
 
+def fd_buses(frames: list[Frame]) -> list[int]:
+  # the buses with a frame longer than classic CAN's 8 bytes
+  return sorted({bus for frame in frames for _, dat, bus in frame if len(dat) > 8})
+
+
 def manager_died(rc: int) -> RuntimeError:
   return RuntimeError(f"manager died: rc {rc}")
 
@@ -115,6 +120,15 @@ class Drive:
     if rc is not None:
       raise manager_died(rc)
 
+  def _wait_panda(self, sm):
+    end = time.monotonic() + ONROAD_LIMIT
+    while not len(sm['pandaStates']):
+      self._check_manager()
+      if time.monotonic() > end:
+        raise RigProblem("rig problem: panda not answering")
+      sm.update(10)
+    return sm['pandaStates'][0]
+
   def _wait_onroad(self, sm, can_sock, buses: set[int]) -> None:
     seen: set[int] = set()
     panda_seen = False
@@ -169,6 +183,11 @@ class Drive:
     try:
       self._up('reset')
       self._up('set_ignition', True)
+      # the station's lanes start classic, a CAN FD bus gets the data speed the DUT's panda is set to
+      panda = self._wait_panda(sm)
+      can_states = (panda.canState0, panda.canState1, panda.canState2)
+      for bus in fd_buses(frames):
+        self._up('set_can_data_speed_kbps', bus, can_states[bus].canDataSpeed)
       called = time.monotonic()
       self._up('can_replay', frames)
       self.replay_call_s = time.monotonic() - called
