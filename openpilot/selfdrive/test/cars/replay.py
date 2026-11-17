@@ -66,6 +66,12 @@ def needed_messages(CP: structs.CarParams, rx_checks: dict[tuple[int, int], bool
   for p in parsers:
     for addr in p.message_states:
       needed.add((p.bus, addr))
+  # keep each read bus alive, the parser times out a bus with no frame for 500 ms
+  counts = Counter((bus, addr) for frame in frames for addr, _, bus in frame)
+  for bus in {p.bus for p in parsers}:
+    on_bus = {k: n for k, n in counts.items() if k[0] == bus}
+    if on_bus:
+      needed.add(max(on_bus, key=on_bus.get))
   return needed
 
 
