@@ -49,6 +49,8 @@ timeout-minutes = 1.5
 [jobs.cars]
 runs-on = "up-can"
 timeout-minutes = 60
+# every master commit, a PR only when it changes the test
+paths = ["openpilot/selfdrive/test/cars/**", "openpilot/selfdrive/test/test_cars.py"]
 env = { COMMA_CACHE = "/data/scons_cache/cars_routes" }
 
 [[jobs.cars.steps]]
