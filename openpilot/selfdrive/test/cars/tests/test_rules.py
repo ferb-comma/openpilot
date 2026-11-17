@@ -61,7 +61,7 @@ def failures(msgs):
 
 class TestRules(unittest.TestCase):
   def test_clean_drive(self):
-    self.assertEqual(failures(clean_drive()), [])
+    assert failures(clean_drive()) == []
 
   def test_brake_disengage(self):
     # the panda drops controls and blocks commands, openpilot disengages right after
@@ -69,7 +69,7 @@ class TestRules(unittest.TestCase):
     msgs.append(panda_state(5., False))
     msgs.append(can_msg('can', 5., [(0x100, 192)]))
     msgs.append(selfdrive_state(5.02, False))
-    self.assertEqual(failures(msgs), [])
+    assert failures(msgs) == []
 
   def test_stuck_engaged_after_drop(self):
     msgs = clean_drive(3.)
@@ -78,19 +78,19 @@ class TestRules(unittest.TestCase):
     for i in range(3):
       msgs.append(can_msg('sendcan', 5.01 + i, [(0x100, 0)]))
       msgs.append(selfdrive_state(5.02 + i, True))
-    self.assertTrue(any("controls_allowed false while engaged" in f for f in failures(msgs)))
+    assert any("controls_allowed false while engaged" in f for f in failures(msgs))
 
   def test_not_engaged_names_reasons(self):
     msgs = [panda_state(0., False), selfdrive_state(0., False)]
     msgs += [onroad_events(0.5, 'calibrationIncomplete', noEntry=True), panda_state(1., True), selfdrive_state(3.5, False)]
     result = failures(msgs)
-    self.assertEqual(len(result), 1)
-    self.assertIn("calibrationIncomplete (noEntry)", result[0])
-    self.assertIn("state disabled, engageable False", result[0])
+    assert len(result) == 1
+    assert "calibrationIncomplete (noEntry)" in result[0]
+    assert "state disabled, engageable False" in result[0]
 
   def test_not_engaged_no_events(self):
     msgs = [panda_state(0., False), selfdrive_state(0., False), panda_state(1., True), selfdrive_state(3.5, False)]
-    self.assertIn("no onroadEvents recorded", failures(msgs)[0])
+    assert "no onroadEvents recorded" in failures(msgs)[0]
 
   def test_warmup(self):
     # openpilot doesn't engage on either edge, only the one after the warmup is judged
@@ -104,14 +104,14 @@ class TestRules(unittest.TestCase):
     msgs = clean_drive()
     msgs.append(can_msg('can', 3.05, [(0x100, 192)]))
     result = failures(msgs)
-    self.assertEqual(len(result), 1)
-    self.assertIn("blocked while engaged", result[0])
+    assert len(result) == 1
+    assert "blocked while engaged" in result[0]
 
   def test_commands_stop(self):
     msgs = [m for m in clean_drive(8.) if not (m.which() == 'sendcan' and m.logMonoTime >= 5e9)]
     result = failures(msgs)
-    self.assertEqual(len(result), 1)
-    self.assertIn("commands stopped", result[0])
+    assert len(result) == 1
+    assert "commands stopped" in result[0]
 
 
 if __name__ == "__main__":
