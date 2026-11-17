@@ -6,6 +6,7 @@ import time
 
 import openpilot.cereal.messaging as messaging
 from openpilot.common.basedir import BASEDIR
+from openpilot.common.params import Params
 from openpilot.selfdrive.test.helpers import set_params_enabled
 from openpilot.selfdrive.test.cars.replay import DT, Frame
 from openpilot.selfdrive.test.cars.rules import NO_CAR_MODES
@@ -80,6 +81,10 @@ class Drive:
 
   def _start_manager(self, scenario: Scenario) -> None:
     set_params_enabled()
+    # calibrationd drops the seeded calibration when the previous route was another car, so no previous car
+    params = Params()
+    params.remove("CarParamsPersistent")
+    params.remove("CarParamsPrevRoute")
     env = os.environ | {
       'FINGERPRINT': scenario.car_model,
       'SKIP_FW_QUERY': '1',
