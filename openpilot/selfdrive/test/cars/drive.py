@@ -65,8 +65,6 @@ class Drive:
   def __init__(self, up):
     self.up = up
     self._manager: subprocess.Popen | None = None
-    # how long the last up.can_replay call took, the UP gets every frame in it
-    self.replay_call_s = 0.
 
   def _up(self, call: str, *args):
     # the UP not answering is the rack's problem
@@ -166,10 +164,7 @@ class Drive:
       can_states = (panda.canState0, panda.canState1, panda.canState2)
       for bus in fd_buses(frames):
         self._up('set_can_data_speed_kbps', bus, can_states[bus].canDataSpeed)
-      called = time.monotonic()
       self._up('can_replay', frames)
-      self.replay_call_s = time.monotonic() - called
-      print(f"up.can_replay took {self.replay_call_s:.2f} s")
       self._wait_onroad(sm, can_sock, buses)
       return self._record()
     finally:

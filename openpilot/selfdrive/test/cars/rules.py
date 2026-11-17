@@ -121,8 +121,9 @@ def _openpilot_reasons(rec: Recording, end: float) -> str:
   return ", ".join(parts)
 
 
-def _not_engaged(rec: Recording) -> list[tuple[float, str]]:
-  failures = []
+def _edges(rec: Recording) -> list[tuple[float, bool]]:
+  # each judged engage edge of the panda and whether openpilot engaged within the limit
+  edges = []
   prev_allowed = None
   for i, state in _panda_states(rec):
     allowed = state.controlsAllowed
@@ -132,10 +133,17 @@ def _not_engaged(rec: Recording) -> list[tuple[float, str]]:
       for pos, idx in enumerate(rec.sd_idx):
         if idx > i and rec.t(idx) <= edge + ENGAGE_LIMIT and rec.sd_enabled[pos]:
           engaged = True
-      if not engaged:
-        reasons = _openpilot_reasons(rec, edge + ENGAGE_LIMIT)
-        failures.append((edge, f"t={edge:.2f} not engaged within {ENGAGE_LIMIT:.0f}s of controls_allowed: {reasons}"))
+      edges.append((edge, engaged))
     prev_allowed = allowed
+  return edges
+
+
+def _not_engaged(rec: Recording) -> list[tuple[float, str]]:
+  failures = []
+  for edge, engaged in _edges(rec):
+    if not engaged:
+      reasons = _openpilot_reasons(rec, edge + ENGAGE_LIMIT)
+      failures.append((edge, f"t={edge:.2f} not engaged within {ENGAGE_LIMIT:.0f}s of controls_allowed: {reasons}"))
   return failures
 
 
@@ -234,3 +242,20 @@ def rule_failures(msgs: list, mode: int, param: int, warmup: float = 0.) -> list
   failures += _safety_pair(rec, mode, param)
   failures += _faults(rec)
   return [line for _, line in sorted(failures, key=lambda f: f[0])]
+
+
+def summary(msgs: list, warmup: float = 0.) -> str:
+  # engage edges openpilot engaged on, and the blocked and sent commands while engaged, after the warmup
+  rec = _load(msgs, warmup)
+  edges = _edges(rec)
+  engaged = sum(e for _, e in edges)
+  blocked = 0
+  cmds = 0
+  for i, msg in enumerate(rec.msgs):
+    if rec.t(i) < warmup or not rec.enabled_at(i):
+      continue
+    if msg.which() == 'can':
+      blocked += sum(c.src - BLOCKED in range(BUSES) for c in msg.can)
+    elif msg.which() == 'sendcan':
+      cmds += len(msg.sendcan)
+  return f"engaged {engaged}/{len(edges)}, {blocked} blocked, {cmds} cmds"
