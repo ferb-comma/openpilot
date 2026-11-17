@@ -60,9 +60,10 @@ class TestCars(OpenpilotTestCase):
     print(f"{len(gaps)} gaps (not driven):", flush=True)
     for gap in gaps:
       print(f"  {gap}", flush=True)
-    models = os.getenv("SCENARIOS")
-    if models is not None:
-      scenarios = [s for s in scenarios if s.car_model in models.split(",")]
+    models = [m.strip() for m in os.getenv("SCENARIOS", "").split(",") if m.strip()]
+    cls.unmatched = [m for m in models if not any(s.car_model == m for s in scenarios)]
+    if models:
+      scenarios = [s for s in scenarios if s.car_model in models]
 
     cls.results = [DriveResult(s) for s in scenarios]
     drive = Drive(UP.remote())
@@ -103,6 +104,10 @@ class TestCars(OpenpilotTestCase):
       result.status = "failed"
       result.error = repr(e)
     result.took = time.monotonic() - start
+
+  def test_something_driven(self):
+    assert not self.unmatched, f"SCENARIOS matched nothing for: {', '.join(self.unmatched)}"
+    assert self.results, "no scenarios were driven"
 
   def test_driven(self, subtests):
     for result in self.results:
