@@ -71,7 +71,7 @@ def needed_messages(CP: structs.CarParams, rx_checks: dict[tuple[int, int], bool
   for bus in {p.bus for p in parsers}:
     on_bus = {k: n for k, n in counts.items() if k[0] == bus}
     if on_bus:
-      needed.add(max(on_bus, key=on_bus.get))
+      needed.add(max(on_bus, key=lambda k: on_bus[k]))
   return needed
 
 
