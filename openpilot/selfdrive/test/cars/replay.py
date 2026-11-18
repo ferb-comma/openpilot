@@ -176,26 +176,33 @@ def value_changes(frames: list[Frame], dbcs: dict[tuple[int, int], str], parsed:
   return changes
 
 
+def _thinned(count: int, changes: set[int], k: int) -> int:
+  # frames a message keeps: its first, every k-th after it and every frame whose values change
+  return math.ceil(count / k) + sum(1 for n in changes if n % k)
+
+
 def thin(CP: structs.CarParams, rx_checks: dict[tuple[int, int], bool], frames: list[Frame], budget: dict[int, float],
-         keep_all: set[tuple[int, int]] | None = None) -> list[Frame]:
-  # keep_all: messages that keep every frame they have
+         steps: dict[tuple[int, int], int] | None = None) -> list[Frame]:
+  # steps: messages that keep every k-th frame for their own k, 1 for every frame they have
+  steps = steps or {}
   seconds = len(frames) * DT
   dbcs = _dbcs(CP)
   parsed = {name: DBC(name) for name in set(dbcs.values())}
   radar_trigger = _radar_trigger(CP)
   counts = Counter((bus, addr) for f in frames for addr, _, bus in f)
-  full = {key for key in counts if key in (keep_all or set()) or _full_rate(dbcs, parsed, rx_checks, radar_trigger, key)}
+  full = {key for key in counts if steps.get(key) == 1 or _full_rate(dbcs, parsed, rx_checks, radar_trigger, key)}
+  own = {key: k for key, k in steps.items() if key in counts and key not in full}
   changes = value_changes(frames, dbcs, parsed, full)
-  # every k-th frame of each other message on a bus, in what the full rate messages leave of the budget
+  # every k-th frame of each other message on a bus, in what the full rate messages and the ones with their own k leave of the budget
   keep = {}
   for bus, rate in budget.items():
     fixed = sum(n for key, n in counts.items() if key[0] == bus and key in full)
-    rest = [key for key in counts if key[0] == bus and key not in full]
+    fixed += sum(_thinned(counts[key], changes.get(key, set()), k) for key, k in own.items() if key[0] == bus)
+    rest = [key for key in counts if key[0] == bus and key not in full and key not in own]
     if not rest:
       continue
-    # each message keeps its first frame, every k-th after it and every frame whose values change
     k = 1
-    while k < len(frames) and fixed + sum(math.ceil(counts[key] / k) + sum(1 for n in changes.get(key, ()) if n % k) for key in rest) > rate * seconds:
+    while k < len(frames) and fixed + sum(_thinned(counts[key], changes.get(key, set()), k) for key in rest) > rate * seconds:
       k += 1
     keep[bus] = k
   # one packer per bus and DBC, so each bus continues its own counters
@@ -207,7 +214,7 @@ def thin(CP: structs.CarParams, rx_checks: dict[tuple[int, int], bool], frames: 
     for addr, dat, bus in frame:
       n = seen[(bus, addr)]
       seen[(bus, addr)] += 1
-      k = 1 if (bus, addr) in full else keep.get(bus, 1)
+      k = 1 if (bus, addr) in full else own.get((bus, addr), keep.get(bus, 1))
       dbc = dbcs.get((bus, addr))
       msg = parsed[dbc].addr_to_msg[addr] if dbc is not None else None
       if n % k and n not in changes.get((bus, addr), ()):
@@ -389,13 +396,14 @@ def build_replay(s: Scenario, car: RouteCar, msgs: list, budget: dict[int, float
   CP = car.dut_CP
   window = window_frames(msgs, s.window)
   needed = needed_frames(CP, s.rx_checks, window)
-  replay = thin(CP, s.rx_checks, needed, budget)
+  steps = {(bus, addr): k for bus, addr, k in s.kept}
+  replay = thin(CP, s.rx_checks, needed, budget, steps)
   added = fingerprint_additions(car, replay)
   if added:
     # the fingerprint messages count against the budget like the rest
     sparse = fingerprint_frames(window, added)
     merged = [a + b for a, b in zip(needed, sparse, strict=True)]
-    replay = thin(CP, s.rx_checks, merged, budget, set(added))
+    replay = thin(CP, s.rx_checks, merged, budget, steps | dict.fromkeys(added, 1))
   return Replay(replay, added, car.cache, len(car.dut_fw), car.no_fw)
 
 

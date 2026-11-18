@@ -3,7 +3,7 @@ import unittest
 from opendbc.car import structs
 from opendbc.car.car_helpers import interfaces
 
-from openpilot.selfdrive.test.cars.fidelity import LOOPS, SLACK, Engage, diverging, engage_problems, selfdrive
+from openpilot.selfdrive.test.cars.fidelity import LOOPS, SLACK, Engage, Fidelity, diverging, engage_problems, selfdrive
 
 ButtonType = structs.CarState.ButtonEvent.Type
 GearShifter = structs.CarState.GearShifter
@@ -82,21 +82,36 @@ class TestSelfdrive(unittest.TestCase):
 
 class TestEngageProblems(unittest.TestCase):
   def test_engaged(self):
-    assert engage_problems(Engage([500], [500], [], False, False, None), 15.) == []
+    assert engage_problems(Engage([500], [500], [], False, False, None, [], []), 15.) == []
 
   def test_stays_allowed(self):
-    problems = engage_problems(Engage([], [], [], True, True, None), 15.)
+    problems = engage_problems(Engage([], [], [], True, True, None, [], []), 15.)
     assert problems == ["the panda stays allowed across the loop's wrap, nothing before the edge drops it"]
 
   def test_carried(self):
-    assert engage_problems(Engage([500], [500], [], False, True, None), 15.) == ["openpilot stays engaged across the loop's wrap"]
+    assert engage_problems(Engage([500], [500], [], False, True, None, [], []), 15.) == ["openpilot stays engaged across the loop's wrap"]
 
   def test_blocked(self):
-    problems = engage_problems(Engage([500], [None], ["resumeBlocked at 5.00 s"], False, False, None), 15.)
+    problems = engage_problems(Engage([500], [None], ["resumeBlocked at 5.00 s"], False, False, None, [], []), 15.)
     assert problems == ["openpilot doesn't engage at the panda's edge: resumeBlocked at 5.00 s"]
 
   def test_late_edge(self):
-    assert engage_problems(Engage([1200], [1200], [], False, False, None), 15.)[0].startswith("the panda's edge at 12.00 s leaves less than")
+    assert engage_problems(Engage([1200], [1200], [], False, False, None, [], []), 15.)[0].startswith("the panda's edge at 12.00 s leaves less than")
+
+
+class TestFidelityProblems(unittest.TestCase):
+  def test_changed_field_alone_engages_as_route(self):
+    f = Fidelity([], [], {'gasPressed': 'route ..., replay ...'}, 0)
+    assert f.problems == []
+    assert "the replay changes gasPressed" in f.summary()
+
+  def test_changed_field_with_engage_problem(self):
+    f = Fidelity([], ["openpilot's enabled: ..."], {'buttonEvents': 'route ..., replay ...'}, None)
+    assert f.problems == ["the replay: openpilot's enabled: ...", "the replay changes buttonEvents: route ..., replay ..."]
+
+  def test_window_problem_first(self):
+    f = Fidelity(["openpilot doesn't engage at the panda's edge: resumeBlocked at 4.99 s"], ["x"], {'gasPressed': ''}, None)
+    assert f.problems == ["the route's window: openpilot doesn't engage at the panda's edge: resumeBlocked at 4.99 s"]
 
 
 if __name__ == "__main__":

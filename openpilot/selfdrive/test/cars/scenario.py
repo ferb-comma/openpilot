@@ -63,6 +63,9 @@ class Scenario:
   max_idle: int
   # the DUT turns on AlphaLongitudinalEnabled, the route drove with openpilot longitudinal where it's a toggle
   alpha_long: bool
+  # (bus, addr, k) of the messages the replay keeps every k-th frame of instead of thinning them with the rest, so it keeps
+  # the signals that engage openpilot and the panda
+  kept: tuple[tuple[int, int, int], ...] = ()
 
 
 def _first_can(msgs: list) -> int | None:
@@ -315,8 +318,9 @@ def route_segments(route: str) -> list[int]:
   return sorted({int(Path(urlparse(url).path).parent.name) for url in logs})
 
 
-# what keeps a scenario's replay from playing its car on a station, from the route's car and log, empty if nothing
-Check = Callable[[Scenario, RouteCar, list], list[str]]
+# the scenario with its replay made faithful where it can be, and what keeps the replay from playing its car on a station,
+# from the route's car and log, empty if nothing
+Check = Callable[[Scenario, RouteCar, list], tuple[Scenario, list[str]]]
 
 
 @dataclass
@@ -359,7 +363,7 @@ def segment_data(route: CarTestRoute, segment: int, check: Check) -> SegmentData
       continue
     scenario = Scenario(route.route, segment, str(route.car_model), data.pair[0], data.pair[1], window, rise, checks, idle, car.alpha_long)
     try:
-      problems = check(scenario, car, msgs)
+      scenario, problems = check(scenario, car, msgs)
     except Exception as e:
       problems = [f"replay check failed: {e!r}"]
     data.checked.append((scenario, problems))
@@ -504,6 +508,7 @@ def load_scenarios() -> tuple[list[Scenario], list[str]]:
   for row in data["scenarios"]:
     row["window"] = Window(**row["window"])
     row["rx_checks"] = {(bus, addr): counter for bus, addr, counter in row["rx_checks"]}
+    row["kept"] = tuple((bus, addr, k) for bus, addr, k in row.get("kept", []))
     scenarios.append(Scenario(**row))
   return scenarios, data["gaps"]
 
