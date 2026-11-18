@@ -352,14 +352,33 @@ def _tx_hook(safety, addr: int, bus: int, dat: bytes, t: float) -> bool:
   return bool(safety.safety_tx_hook(libsafety_py.make_CANPacket(addr, bus, dat)))
 
 
-def safety_decisions(rec: Recording, mode: int, param: int, safety) -> dict[tuple[int, int], Decision]:
-  # (message index, frame index) of each frame openpilot sent that the panda sent (src + 128) or blocked (src + 192) -> libsafety's decision.
+@dataclass
+class SafetyReplay:
+  # the recording replayed through libsafety: (message index, frame index) of each frame openpilot sent that the panda sent (src + 128)
+  # or blocked (src + 192) -> libsafety's decision, libsafety's state from each message index it changed at, and each TX echo's time
+  decisions: dict[tuple[int, int], Decision] = field(default_factory=dict)
+  states: list[tuple[int, dict[str, bool]]] = field(default_factory=list)
+  echoes: list[float] = field(default_factory=list)
+  # logMonoTime of the recording's first message, the times are from it
+  first: int = 0
+
+  def t(self, rec: Recording, i: int) -> float:
+    return (rec.msgs[i].logMonoTime - self.first) / 1e9
+
+  def change_at(self, i: int) -> tuple[int, dict[str, bool], dict[str, bool]]:
+    # libsafety's last change at or before message i: its message index, the state before it and after
+    n = bisect.bisect_right([at for at, _ in self.states], i) - 1
+    before = self.states[n - 1][1] if n > 0 else self.states[0][1]
+    return self.states[n][0], before, self.states[n][1]
+
+
+def safety_replay(rec: Recording, mode: int, param: int, safety) -> SafetyReplay:
   # the panda queues its echo or block of a frame with the rx (src 0-2) as its tx hook takes it, so libsafety takes the frame there,
   # with openpilot's engaged state in the heartbeat. its real-time checks count frames on its timer as they arrive, so libsafety
   # times each frame by its echo like the rx, not by card's sendcan, a pandad stall sends a burst. the panda also echoes the frames
   # it forwards, those match no sent frame
   if safety.set_safety_hooks(mode, param) != 0:
-    return {}
+    return SafetyReplay()
   first = rec.msgs[0].logMonoTime if rec.msgs else 0
   # (addr, bus) -> the data and sendcan time of each sent frame not yet echoed
   pending: dict[tuple[int, int], list[tuple[bytes, int]]] = {}
@@ -369,6 +388,7 @@ def safety_decisions(rec: Recording, mode: int, param: int, safety) -> dict[tupl
   changed = 0.
   # the time of each TX frame's echo, in order
   echoes: list[float] = []
+  states = [(-1, state)]
   for i, msg in enumerate(rec.msgs):
     which = msg.which()
     t = (msg.logMonoTime - first) / 1e9
@@ -410,7 +430,8 @@ def safety_decisions(rec: Recording, mode: int, param: int, safety) -> dict[tupl
       if now != state:
         state = now
         changed = t
-  return decisions
+        states.append((i, state))
+  return SafetyReplay(decisions, states, echoes, first)
 
 
 def _latest(rec: Recording, i: int, which: str):
@@ -431,18 +452,28 @@ def _decoded(dbcs: list[DBC], addr: int, dat: bytes) -> str:
 
 def block_context(rec: Recording, i: int, frame, decision: Decision | None, dbcs: list[DBC]) -> list[str]:
   # the panda's, libsafety's and openpilot's view when they decided differently on a frame
-  lines = [f"frame: {_decoded(dbcs, frame.address, bytes(frame.dat))}"]
-  panda = _latest(rec, i, 'pandaStates')
-  if panda is not None and len(panda):
-    p = panda[0]
-    checks = f"rx checks invalid {int(p.safetyRxChecksInvalid)}, tx blocked {p.safetyTxBlocked}"
-    lines.append(f"panda: controls_allowed {int(p.controlsAllowed)}, rx invalid {p.safetyRxInvalid}, {checks}")
-    # pandad's link to the panda over the recording
-    start = next(state for _, state in _panda_states(rec))
-    link = [f"{name} +{getattr(p, name) - getattr(start, name)}" for name in ('spiErrorCount', 'txBufferOverflow', 'rxBufferOverflow')]
-    lines.append(f"panda link since the recording's start: {', '.join(link)}")
+  lines = [f"frame: {_decoded(dbcs, frame.address, bytes(frame.dat))}"] + _panda_context(rec, i)
   if decision is not None:
     lines.append(decision.describe())
+  return lines + _openpilot_context(rec, i)
+
+
+def _panda_context(rec: Recording, i: int) -> list[str]:
+  # the panda's latest pandaStates at message i, and pandad's link to it over the recording
+  panda = _latest(rec, i, 'pandaStates')
+  if panda is None or not len(panda):
+    return []
+  p = panda[0]
+  checks = f"rx checks invalid {int(p.safetyRxChecksInvalid)}, tx blocked {p.safetyTxBlocked}, heartbeat lost {int(p.heartbeatLost)}"
+  lines = [f"panda: controls_allowed {int(p.controlsAllowed)}, rx invalid {p.safetyRxInvalid}, {checks}, fault status {p.faultStatus}"]
+  start = next(state for _, state in _panda_states(rec))
+  link = [f"{name} +{getattr(p, name) - getattr(start, name)}" for name in ('spiErrorCount', 'txBufferOverflow', 'rxBufferOverflow')]
+  lines.append(f"panda link since the recording's start: {', '.join(link)}")
+  return lines
+
+
+def _openpilot_context(rec: Recording, i: int) -> list[str]:
+  lines = []
   CS = _latest(rec, i, 'carState')
   if CS is not None:
     pedals = f"gasPressed {int(CS.gasPressed)}, brakePressed {int(CS.brakePressed)}"
@@ -453,11 +484,11 @@ def block_context(rec: Recording, i: int, frame, decision: Decision | None, dbcs
   return lines
 
 
-def _blocked_while_engaged(rec: Recording, mode: int, param: int, safety, why_not: str, dbcs: list[DBC]) -> Check:
+def _blocked_while_engaged(rec: Recording, replay: SafetyReplay | None, why_not: str, dbcs: list[DBC]) -> Check:
   # the panda and libsafety, fed the same rx, have to decide the same on each command: a block libsafety allows or a command
   # libsafety blocks is a failure, unless libsafety blocks it right after its state changed, a transition openpilot reacts to
   # a cycle later. without libsafety every block is
-  decisions = safety_decisions(rec, mode, param, safety) if safety is not None else {}
+  decisions = replay.decisions if replay is not None else {}
   failures = []
   notes = []
   reported = set()
@@ -501,7 +532,7 @@ def _blocked_while_engaged(rec: Recording, mode: int, param: int, safety, why_no
       if sent:
         line = f"t={t:.2f} sent while engaged, addr {frame.address:#x} bus {bus}, libsafety blocks it, not at a transition"
       else:
-        if safety is None:
+        if replay is None:
           reason = "not replayed through libsafety"
         elif decision is None:
           reason = "libsafety has no decision on it"
@@ -513,7 +544,7 @@ def _blocked_while_engaged(rec: Recording, mode: int, param: int, safety, why_no
       failures.append((t, line))
       notes += [f"t={t:.2f} {line}" for line in block_context(rec, i, frame, decision, dbcs)]
   evidence = f"{commands} commands while engaged, {blocked} blocked by the panda"
-  if safety is None:
+  if replay is None:
     evidence += f", not replayed through libsafety, {why_not}" if why_not else ""
   else:
     evidence += f", {transitions} of them at a transition libsafety blocks too, {sent_blocked} sent that libsafety blocks"
@@ -522,10 +553,37 @@ def _blocked_while_engaged(rec: Recording, mode: int, param: int, safety, why_no
   return Check(evidence, failures, notes)
 
 
-def _controls_allowed_dropped(rec: Recording) -> Check:
+def _drop_context(rec: Recording, i: int, replay: SafetyReplay | None) -> tuple[bool, str, list[str]]:
+  # whether the panda's drop at message i is a transition openpilot disengages on in its latency, why, and the evidence:
+  # libsafety's controls_allowed on the same rx and tx and the flags of its last change, the panda's, openpilot's and the TX timing
+  lines = _panda_context(rec, i) + _openpilot_context(rec, i)
+  if replay is None or not replay.states:
+    return False, "not replayed through libsafety", lines
+  at, before, after = replay.change_at(i)
+  t = replay.t(rec, i)
+  since = t - replay.t(rec, at) if at >= 0 else t
+  flags = ", ".join(f"{name} {int(before[name])} → {int(value)}" for name, value in after.items() if value != before[name])
+  lines.append(f"libsafety: controls_allowed {int(after['controls_allowed'])}, last changed {since * 1e3:.0f} ms before: {flags or 'nothing'}")
+  recent, max_gap, burst = _tx_timing(replay.echoes, t)
+  lines.append(f"TX: {recent} frames echoed in the {RT_INTERVAL * 1e3:.0f} ms before, largest gap {max_gap * 1e3:.0f} ms")
+  if after['controls_allowed']:
+    panda = _latest(rec, i, 'pandaStates')
+    lagged = panda is not None and len(panda) and (panda[0].safetyRxChecksInvalid or panda[0].heartbeatLost)
+    why = "rig timing, the panda's rx checks lagged or its heartbeat was lost" if lagged else "a real disagreement"
+    return False, f"libsafety keeps controls allowed on the same rx, {why}", lines
+  # openpilot disengages on what drops controls a few cycles later
+  disengaged = next((rec.t(idx) for pos, idx in enumerate(rec.sd_idx) if idx > at and not rec.sd_enabled[pos]), None)
+  if at >= 0 and disengaged is not None and disengaged - rec.t(at) <= TRANSITION * DT:
+    return True, "", lines
+  return False, f"libsafety drops controls too ({flags}), openpilot doesn't disengage within {TRANSITION} cycles", lines
+
+
+def _controls_allowed_dropped(rec: Recording, replay: SafetyReplay | None) -> Check:
   failures = []
+  notes = []
   reported = set()
   held = 0
+  transitions = 0
   for i, state in _panda_states(rec):
     if not rec.enabled_at(i) or not rec.stays_enabled(i):
       continue
@@ -543,11 +601,17 @@ def _controls_allowed_dropped(rec: Recording) -> Check:
       pos -= 1
     t = rec.t(i)
     if t - rec.t(rec.sd_idx[pos]) > ENGAGE_LIMIT:
+      transition, why, lines = _drop_context(rec, i, replay)
+      if transition:
+        transitions += 1
+        continue
       reported.add(span)
-      failures.append((t, f"t={t:.2f} controls_allowed false while engaged"))
+      failures.append((t, f"t={t:.2f} controls_allowed false while engaged, {why}"))
+      notes += [f"t={t:.2f} {line}" for line in lines]
   if failures:
-    return Check("controls_allowed dropped while engaged", failures)
-  return Check(f"controls_allowed held while engaged ({held} panda states)", failures)
+    return Check("controls_allowed dropped while engaged", failures, notes)
+  dropped = f", {transitions} drops libsafety makes too and openpilot disengages on" if transitions else ""
+  return Check(f"controls_allowed held while engaged ({held} panda states{dropped})", failures)
 
 
 def _idle_context(rec: Recording, last_command: int, i: int) -> list[str]:
@@ -671,11 +735,12 @@ def rule_checks(msgs: list, mode: int, param: int, max_idle: int, start: int | N
                 car_model: str = "") -> list[Check]:
   # safety: libsafety to replay the recording through, why_not: why there is none
   rec = _load(msgs, start)
+  replay = safety_replay(rec, mode, param, safety) if safety is not None else None
   return [
     _not_engaged(rec),
-    _blocked_while_engaged(rec, mode, param, safety, why_not, car_dbcs(car_model)),
+    _blocked_while_engaged(rec, replay, why_not, car_dbcs(car_model)),
     _commands_stopped(rec, max_idle),
-    _controls_allowed_dropped(rec),
+    _controls_allowed_dropped(rec, replay),
     _safety_pair(rec, mode, param),
     _faults(rec),
   ]

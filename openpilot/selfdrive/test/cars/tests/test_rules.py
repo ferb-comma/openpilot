@@ -129,6 +129,35 @@ class FakeSafety:
     return lambda *args: None
 
 
+BRAKE = 0x300
+
+
+class DropSafety(FakeSafety):
+  # libsafety that drops controls on a brake frame, or keeps them
+  def __init__(self, drops=True):
+    super().__init__()
+    self.drops = drops
+    self.allowed = True
+
+  def safety_rx_hook(self, packet):
+    self.allowed &= not (self.drops and packet[0].addr == BRAKE)
+
+  def __getattr__(self, name):
+    if name == 'get_controls_allowed':
+      return lambda: self.allowed
+    return super().__getattr__(name)
+
+
+def dropped_drive(disengage_at):
+  # engaged from 1.5 s, the brake frame at 4.995 s drops the panda's controls, openpilot disengages at disengage_at
+  msgs = clean_drive(3.)
+  msgs.append(can_msg('can', 4.995, [(BRAKE, 0)]))
+  msgs.append(panda_state(5., False))
+  msgs.append(selfdrive_state(disengage_at - 0.01, True))
+  msgs.append(selfdrive_state(disengage_at, False))
+  return msgs
+
+
 def oracle_failures(msgs, safety):
   return rule_failures(msgs, TOYOTA, 0, 0, safety=safety)
 
@@ -229,6 +258,20 @@ class TestRules(unittest.TestCase):
       msgs.append(can_msg('sendcan', 5.01 + i, [(0x100, 0)]))
       msgs.append(selfdrive_state(5.02 + i, True))
     assert any("controls_allowed false while engaged" in f for f in failures(msgs))
+
+  def test_drop_libsafety_makes_too(self):
+    # libsafety drops on the same brake frame and openpilot disengages in its latency, a transition
+    assert oracle_failures(dropped_drive(5.02), DropSafety()) == []
+
+  def test_drop_openpilot_stays_engaged(self):
+    result = oracle_failures(dropped_drive(5.5), DropSafety())
+    assert len(result) == 1
+    assert result[0].endswith("libsafety drops controls too (controls_allowed 1 → 0), openpilot doesn't disengage within 3 cycles")
+
+  def test_drop_libsafety_keeps_allowed(self):
+    checks = rule_checks(dropped_drive(5.02), TOYOTA, 0, 0, safety=DropSafety(drops=False))
+    assert checks[3].failures[0][1] == "t=5.00 controls_allowed false while engaged, libsafety keeps controls allowed on the same rx, a real disagreement"
+    assert any("libsafety: controls_allowed" in note for note in checks[3].notes)
 
   def test_not_engaged_names_reasons(self):
     msgs = [panda_state(0., False), selfdrive_state(0., False)]
