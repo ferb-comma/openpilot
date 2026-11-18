@@ -13,7 +13,7 @@ from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.test.cars.drive import Drive, DriveFailed, RigProblem
 from openpilot.selfdrive.test.cars.replay import BUDGET, build_replay
 from openpilot.selfdrive.test.cars.rules import rule_failures, summary
-from openpilot.selfdrive.test.cars.scenario import LENGTH, Scenario, load_scenario, load_scenarios
+from openpilot.selfdrive.test.cars.scenario import Scenario, load_scenario, load_scenarios
 
 NOT_DRIVEN = "not driven"
 RIG_PROBLEM = "rig problem"
@@ -36,6 +36,7 @@ class DriveResult:
   took: float = 0.
   # seconds from manager start to onroad
   onroad: float | None = None
+  recorded: float = 0.
 
   @property
   def name(self) -> str:
@@ -56,7 +57,7 @@ class DriveResult:
 
   @property
   def times(self) -> str:
-    onroad = f"onroad {self.onroad:.0f} s, " if self.onroad is not None else ""
+    onroad = f"onroad {self.onroad:.0f} s, recorded {self.recorded:.0f} s, " if self.onroad is not None else ""
     return f"{onroad}{self.took:.0f} s"
 
   def line(self) -> str:
@@ -120,8 +121,9 @@ class TestCars(OpenpilotTestCase):
       frames = build_replay(s, CP, msgs, BUDGET)
       log = drive.run(s, frames)
       result.onroad = log.onroad
-      result.failures = rule_failures(log.msgs, s.mode, s.param, warmup=LENGTH)
-      result.stats = summary(log.msgs, warmup=LENGTH)
+      result.recorded = log.length
+      result.failures = rule_failures(log.msgs, s.mode, s.param, start=log.start)
+      result.stats = summary(log.msgs, start=log.start)
       result.status = "passed" if not result.failures else "failed"
     except RigProblem as e:
       result.status = RIG_PROBLEM

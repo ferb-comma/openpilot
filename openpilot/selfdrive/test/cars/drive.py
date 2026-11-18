@@ -1,4 +1,5 @@
 # one scenario on a DUT in an ultimate provisioning (UP) station, the UP plays the scenario's car
+import math
 import os
 import signal
 import subprocess
@@ -11,12 +12,14 @@ from openpilot.common.params import Params
 from openpilot.selfdrive.test.helpers import set_params_enabled
 from openpilot.selfdrive.test.cars.replay import DT, Frame
 from openpilot.selfdrive.test.cars.rules import NO_CAR_MODES, log_line
-from openpilot.selfdrive.test.cars.scenario import LENGTH, Scenario
+from openpilot.selfdrive.test.cars.scenario import Scenario
 
 # seconds from manager start, ~2x the measured normal onroad time (20-25 s)
 ONROAD_LIMIT = 45.
-# a warmup loop, then one full loop of the window, the rules judge the second
-RECORD_TIME = 2 * LENGTH
+# long enough for ENGAGE_LIMIT plus a stretch of engaged commands
+ENGAGED_RECORD = 10.
+# subscribed this long before the recording window, so the states before its start are known
+PREROLL = 0.5
 RECORD = ('can', 'sendcan', 'pandaStates', 'selfdriveState', 'carState', 'onroadEvents', 'managerState', 'errorLogMessage')
 # the panda marks its own tx echoes with src + 128
 ECHO = 128
@@ -35,6 +38,9 @@ class DriveLog:
   msgs: list
   # seconds from manager start to onroad
   onroad: float
+  # logMonoTime and seconds of the recording window
+  start: int
+  length: float
 
 
 def onroad_missing(sm) -> list[str]:
@@ -161,12 +167,14 @@ class Drive:
           missing.append(f"last error {error}")
         raise DriveFailed(f"not onroad {ONROAD_LIMIT:g} s after manager start: {', '.join(missing)}")
 
-  def _record(self) -> list:
+  def _record(self, start: float, end: float) -> list:
+    while time.monotonic() < start - PREROLL:
+      self._check_manager()
+      time.sleep(DT)
     socks = [messaging.sub_sock(s, conflate=False) for s in RECORD]
     for sock in socks:
       messaging.drain_sock_raw(sock)
     msgs = []
-    end = time.monotonic() + RECORD_TIME
     while time.monotonic() < end:
       self._check_manager()
       for sock in socks:
@@ -193,8 +201,14 @@ class Drive:
       for bus in fd_buses(frames):
         self._up('set_can_data_speed_kbps', bus, can_states[bus].canDataSpeed)
       self._up('can_replay', frames)
+      # the loop's 10 ms clock starts as can_replay returns
+      t0 = time.monotonic()
+      period = len(frames) * DT
       onroad = self._wait_onroad(sm, can_sock, error_sock, buses)
-      return DriveLog(self._record(), onroad)
+      # record from the next loop start through its engage edge and the engaged stretch after it
+      start = t0 + math.ceil((time.monotonic() - t0) / period) * period
+      end = start + (scenario.rise - scenario.window.start) + ENGAGED_RECORD
+      return DriveLog(self._record(start, end), onroad, int(start * 1e9), end - start)
     finally:
       try:
         self._up('reset')

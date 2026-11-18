@@ -20,14 +20,13 @@ NO_CAR_MODES = (
 @dataclass
 class Recording:
   msgs: list
+  # logMonoTime the recording window starts at, engage edges and engaged spans before it are not judged
   start: int
   # message index and enabled of each selfdriveState
   sd_idx: list[int]
   sd_enabled: list[bool]
   # engaged span number of each selfdriveState, counting enable edges
   sd_span: list[int]
-  # engage edges and engaged spans that start before this are not judged
-  warmup: float = 0.
 
   def t(self, i: int) -> float:
     return (self.msgs[i].logMonoTime - self.start) / 1e9
@@ -52,7 +51,7 @@ class Recording:
 
   def judged_span(self, span: int) -> bool:
     first, _ = self.spans()[span - 1]
-    return self.t(self.sd_idx[first]) >= self.warmup
+    return self.t(self.sd_idx[first]) >= 0.
 
   def spans(self) -> list[tuple[int, int]]:
     # (first, last) positions in sd_idx of each run of enabled samples
@@ -69,7 +68,7 @@ class Recording:
     return spans
 
 
-def _load(msgs: list, warmup: float) -> Recording:
+def _load(msgs: list, start: int | None) -> Recording:
   msgs = sorted(msgs, key=lambda m: m.logMonoTime)
   sd_idx = []
   sd_enabled = []
@@ -85,7 +84,9 @@ def _load(msgs: list, warmup: float) -> Recording:
       sd_idx.append(i)
       sd_enabled.append(enabled)
       sd_span.append(span)
-  return Recording(msgs, msgs[0].logMonoTime if msgs else 0, sd_idx, sd_enabled, sd_span, warmup)
+  if start is None:
+    start = msgs[0].logMonoTime if msgs else 0
+  return Recording(msgs, start, sd_idx, sd_enabled, sd_span)
 
 
 def _panda_states(rec: Recording):
@@ -164,7 +165,7 @@ def _edges(rec: Recording) -> list[tuple[float, bool]]:
   prev_allowed = None
   for i, state in _panda_states(rec):
     allowed = state.controlsAllowed
-    if allowed and prev_allowed is False and rec.t(i) >= rec.warmup:
+    if allowed and prev_allowed is False and rec.t(i) >= 0.:
       edge = rec.t(i)
       engaged = rec.enabled_at(i)
       for pos, idx in enumerate(rec.sd_idx):
@@ -228,7 +229,7 @@ def _commands_stopped(rec: Recording) -> list[tuple[float, str]]:
   failures = []
   sendcan_idx = [i for i, msg in enumerate(rec.msgs) if msg.which() == 'sendcan' and len(msg.sendcan) > 0]
   for first, last in rec.spans():
-    if rec.t(rec.sd_idx[first]) < rec.warmup:
+    if rec.t(rec.sd_idx[first]) < 0.:
       continue
     for pos in range(first + 1, last + 1):
       lo = rec.sd_idx[pos - 1]
@@ -271,8 +272,8 @@ def _faults(rec: Recording) -> list[tuple[float, str]]:
   return failures
 
 
-def rule_failures(msgs: list, mode: int, param: int, warmup: float = 0.) -> list[str]:
-  rec = _load(msgs, warmup)
+def rule_failures(msgs: list, mode: int, param: int, start: int | None = None) -> list[str]:
+  rec = _load(msgs, start)
   failures = []
   failures += _not_engaged(rec)
   failures += _blocked_while_engaged(rec)
@@ -283,15 +284,15 @@ def rule_failures(msgs: list, mode: int, param: int, warmup: float = 0.) -> list
   return [line for _, line in sorted(failures, key=lambda f: f[0])]
 
 
-def summary(msgs: list, warmup: float = 0.) -> str:
-  # engage edges openpilot engaged on, and the blocked and sent commands while engaged, after the warmup
-  rec = _load(msgs, warmup)
+def summary(msgs: list, start: int | None = None) -> str:
+  # engage edges openpilot engaged on, and the blocked and sent commands while engaged, from the start
+  rec = _load(msgs, start)
   edges = _edges(rec)
   engaged = sum(e for _, e in edges)
   blocked = 0
   cmds = 0
   for i, msg in enumerate(rec.msgs):
-    if rec.t(i) < warmup or not rec.enabled_at(i):
+    if rec.t(i) < 0. or not rec.enabled_at(i):
       continue
     if msg.which() == 'can':
       blocked += sum(c.src - BLOCKED in range(BUSES) for c in msg.can)

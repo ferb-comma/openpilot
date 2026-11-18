@@ -114,13 +114,13 @@ class TestRules(unittest.TestCase):
     assert log_line(json.dumps(record)) == 'card: {"event": "fingerprinted", "car_fingerprint": "MAZDA_6"}'
     assert log_line("not json\nline 2") == "?: not json line 2"
 
-  def test_warmup(self):
-    # openpilot doesn't engage on either edge, only the one after the warmup is judged
+  def test_start(self):
+    # openpilot doesn't engage on either edge, only the one after the recording window's start is judged
     msgs = [panda_state(0., False), selfdrive_state(0., False), panda_state(1., True), panda_state(2., False)]
     msgs += [panda_state(5., True), selfdrive_state(7.5, False)]
-    result = rule_failures(msgs, TOYOTA, 0, warmup=4.)
+    result = rule_failures(msgs, TOYOTA, 0, start=int(4e9))
     assert len(result) == 1
-    assert result[0].startswith("t=5.00 not engaged")
+    assert result[0].startswith("t=1.00 not engaged")
 
   def test_blocked_while_engaged(self):
     msgs = clean_drive()
