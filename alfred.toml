@@ -47,7 +47,7 @@ timeout-minutes = 1.5
 
 # every car's engaged route window from scenarios.json end to end, the UP plays the car. the route logs live in the cache
 [jobs.cars]
-runs-on = "up-can"
+runs-on = "up-mici"
 timeout-minutes = 60
 # every master commit, a PR only when it changes the test
 paths = ["openpilot/selfdrive/test/cars/**", "openpilot/selfdrive/test/test_cars.py"]
