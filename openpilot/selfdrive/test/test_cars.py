@@ -14,7 +14,7 @@ from openpilot.common.basedir import BASEDIR
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.test.cars.drive import Drive, DriveFailed, RigProblem
 from openpilot.selfdrive.test.cars.replay import BUDGET, Replay, scenario_replay
-from openpilot.selfdrive.test.cars.rules import SAFETY_MODELS, Check, failure_lines, fingerprinted, rule_checks, summary
+from openpilot.selfdrive.test.cars.rules import SAFETY_MODELS, Check, failure_lines, fingerprinted, load_libsafety, rule_checks, summary
 from openpilot.selfdrive.test.cars.scenario import DASHCAM_ONLY, Scenario, load_scenarios
 
 NOT_DRIVEN = "not driven"
@@ -150,6 +150,10 @@ class TestCars(OpenpilotTestCase):
       print(f"{cls.shard_label}drives {', '.join(s.car_model for s in scenarios) or 'nothing'}", flush=True)
 
     cls.results = [DriveResult(s, shared_model=car_models.count(s.car_model) > 1) for s in scenarios]
+    # the panda's decisions are checked against libsafety's on the same rx
+    safety, why_not = load_libsafety()
+    if why_not:
+      print(f"every block fails, {why_not}", flush=True)
     drive = Drive(UP.remote())
     start = time.monotonic()
     # builds the next car's replay while this one drives, at the lowest priority so openpilot keeps its cpu
@@ -173,7 +177,7 @@ class TestCars(OpenpilotTestCase):
           result.error = f"replay build crashed: {crash}"
         else:
           print(f"=== {result.name} ===", flush=True)
-          cls.drive_one(drive, result, current)
+          cls.drive_one(drive, result, current, safety, why_not)
           end_manager_output()
         print(result.line(), flush=True)
         print("\n".join(result.details()), flush=True)
@@ -192,7 +196,7 @@ class TestCars(OpenpilotTestCase):
     cls.summary = f"{cls.job}: {passed} passed, {failed} failed{rig}, {(time.monotonic() - start) / 60:.1f} min"
 
   @staticmethod
-  def drive_one(drive: Drive, result: DriveResult, replay: Future) -> None:
+  def drive_one(drive: Drive, result: DriveResult, replay: Future, safety, why_not: str) -> None:
     s = result.scenario
     start = time.monotonic()
     drive.timing = {}
@@ -200,7 +204,7 @@ class TestCars(OpenpilotTestCase):
     try:
       result.replay = replay.result()
       log = drive.run(s, result.replay)
-      result.checks = rule_checks(log.msgs, s.mode, s.param, s.max_idle, start=log.start)
+      result.checks = rule_checks(log.msgs, s.mode, s.param, s.max_idle, start=log.start, safety=safety, why_not=why_not, car_model=s.car_model)
       result.failures = failure_lines(result.checks)
       result.stats = summary(log.msgs, start=log.start)
       result.fingerprinted = fingerprinted(log.msgs)

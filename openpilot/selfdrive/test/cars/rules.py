@@ -1,13 +1,19 @@
 import bisect
 import json
-from dataclasses import dataclass
+import os
+from contextlib import suppress
+from dataclasses import dataclass, field
 from functools import cached_property
 
+from opendbc.can.dbc import DBC, Msg, SignalType
 from opendbc.car.structs import CarParams
+from opendbc.car.values import PLATFORMS
+from opendbc.safety.tests.libsafety import libsafety_py
 
 # seconds after the panda's engage edge by which openpilot must be enabled
 ENGAGE_LIMIT = 2.
 # the panda marks what it sent with src + 128 and what it blocked with src + 192
+ECHO_BASE = 128
 BLOCKED = 192
 BUSES = 3
 LOG_LINE_LIMIT = 200
@@ -17,6 +23,32 @@ NO_CAR_MODES = (
   int(CarParams.SafetyModel.elm327),
 )
 SAFETY_MODELS = {v: k for k, v in CarParams.SafetyModel.schema.enumerants.items()}
+# openpilot's control cycle
+DT = 0.01
+# the panda takes a CAN edge (a pedal, a cancel, controls dropped) the moment it arrives, card actuates the carControl
+# controlsd made from the previous carState, so a command up to two cycles after the edge still comes from before it,
+# and a recording's can message carries its frames at the time pandad read them, up to a cycle late
+TRANSITION = 3
+# libsafety's state the TX checks depend on
+SAFETY_STATE = ('controls_allowed', 'gas_pressed_prev', 'brake_pressed_prev', 'regen_braking_prev', 'steering_disengage_prev',
+                'cruise_engaged_prev', 'vehicle_moving', 'acc_main_on', 'relay_malfunction')
+
+
+def is_counter(sig) -> bool:
+  return sig.type == SignalType.COUNTER or sig.name == "COUNTER"
+
+
+def signal_values(msg: Msg, dat: bytes) -> dict[str, float]:
+  # the message's signals but its counter and checksum
+  values = {}
+  for sig in msg.sigs.values():
+    if is_counter(sig) or sig.calc_checksum is not None:
+      continue
+    raw = sig.get_raw_value(dat)
+    if sig.is_signed:
+      raw -= ((raw >> (sig.size - 1)) & 0x1) * (1 << sig.size)
+    values[sig.name] = raw * sig.factor + sig.offset
+  return values
 
 
 @dataclass
@@ -202,10 +234,12 @@ class Check:
   # a rule's evidence on a recording, and its failures as (t, line)
   evidence: str
   failures: list[tuple[float, str]]
+  # what explains each failure, and what the rule let pass
+  notes: list[str] = field(default_factory=list)
 
   def lines(self) -> list[str]:
     mark = "✗" if self.failures else "✓"
-    return [f"{mark} {self.evidence}"] + [f"  {line}" for _, line in self.failures]
+    return [f"{mark} {self.evidence}"] + [f"  {line}" for _, line in self.failures] + [f"    {note}" for note in self.notes]
 
 
 def _judged_engaged(rec: Recording, i: int) -> bool:
@@ -229,11 +263,134 @@ def _not_engaged(rec: Recording) -> Check:
   return Check("; ".join(evidence), failures)
 
 
-def _blocked_while_engaged(rec: Recording) -> Check:
+def load_libsafety():
+  # libsafety to replay a recording through, and why there is none. a device has no UBSan runtime for the default build,
+  # so there it builds without the sanitizer
+  try:
+    return libsafety_py.libsafety, ""
+  except Exception:
+    pass
+  coverage = os.environ.get("SAFETY_COVERAGE")
+  os.environ["SAFETY_COVERAGE"] = "1"
+  try:
+    libsafety_py.load(libsafety_py._build_libsafety(release=True))
+    return libsafety_py.libsafety, ""
+  except Exception as e:
+    return None, f"libsafety doesn't build here: {e!r}"
+  finally:
+    if coverage is None:
+      del os.environ["SAFETY_COVERAGE"]
+    else:
+      os.environ["SAFETY_COVERAGE"] = coverage
+
+
+@dataclass
+class Decision:
+  # libsafety's decision on a frame the panda sent or blocked, its state then and how long before it last changed
+  allowed: bool
+  state: dict[str, bool]
+  since_change: float
+
+  def describe(self) -> str:
+    state = ", ".join(f"{name} {int(value)}" for name, value in self.state.items())
+    return f"libsafety {'allows' if self.allowed else 'blocks'} it: {state}, changed {self.since_change * 1e3:.0f} ms before"
+
+
+def _safety_state(safety) -> dict[str, bool]:
+  return {name: bool(getattr(safety, f"get_{name}")()) for name in SAFETY_STATE}
+
+
+def safety_decisions(rec: Recording, mode: int, param: int, safety) -> dict[tuple[int, int], Decision]:
+  # (message index, frame index) of each frame openpilot sent that the panda sent (src + 128) or blocked (src + 192) -> libsafety's decision,
+  # fed the recording's rx (src 0-2) and openpilot's engaged state in the heartbeat in the order pandad read them
+  if safety.set_safety_hooks(mode, param) != 0:
+    return {}
+  # the panda also echoes the frames it forwards, only what openpilot sent went through its tx hook
+  sent = {(c.address, c.src) for m in rec.msgs if m.which() == 'sendcan' for c in m.sendcan}
+  first = rec.msgs[0].logMonoTime if rec.msgs else 0
+  decisions = {}
+  enabled = False
+  tick = None
+  state = _safety_state(safety)
+  changed = 0.
+  for i, msg in enumerate(rec.msgs):
+    which = msg.which()
+    t = (msg.logMonoTime - first) / 1e9
+    if which == 'selfdriveState':
+      enabled = msg.selfdriveState.enabled
+    elif which == 'pandaStates' and len(msg.pandaStates):
+      safety.set_alternative_experience(msg.pandaStates[0].alternativeExperience)
+    if which != 'can':
+      continue
+    safety.set_timer(round(t * 1e6) & 0xFFFFFFFF)
+    # the panda calls safety_tick and checks the heartbeat at 1 Hz
+    if tick is None or t - tick >= 1.:
+      tick = t
+      safety.safety_heartbeat(enabled)
+      safety.safety_tick()
+      safety.safety_heartbeat_check()
+    for k, frame in enumerate(msg.can):
+      if frame.src < BUSES:
+        safety.safety_rx_hook(libsafety_py.make_CANPacket(frame.address, frame.src, frame.dat))
+      elif frame.src - BLOCKED in range(BUSES) or (frame.address, frame.src - ECHO_BASE) in sent:
+        bus = frame.src - (ECHO_BASE if frame.src < BLOCKED else BLOCKED)
+        allowed = bool(safety.safety_tx_hook(libsafety_py.make_CANPacket(frame.address, bus, frame.dat)))
+        decisions[(i, k)] = Decision(allowed, state, t - changed)
+      now = _safety_state(safety)
+      if now != state:
+        state = now
+        changed = t
+  return decisions
+
+
+def _latest(rec: Recording, i: int, which: str):
+  for j in range(i, -1, -1):
+    if rec.msgs[j].which() == which:
+      return getattr(rec.msgs[j], which)
+  return None
+
+
+def _decoded(dbcs: list[DBC], addr: int, dat: bytes) -> str:
+  for dbc in dbcs:
+    msg = dbc.addr_to_msg.get(addr)
+    if msg is not None:
+      values = ", ".join(f"{name} {value:g}" for name, value in signal_values(msg, dat).items())
+      return f"{msg.name} {values}"
+  return f"{dat.hex()} (no DBC describes it)"
+
+
+def block_context(rec: Recording, i: int, frame, decision: Decision | None, dbcs: list[DBC]) -> list[str]:
+  # the panda's, libsafety's and openpilot's view when the panda blocked a frame
+  lines = [f"frame: {_decoded(dbcs, frame.address, bytes(frame.dat))}"]
+  panda = _latest(rec, i, 'pandaStates')
+  if panda is not None and len(panda):
+    p = panda[0]
+    checks = f"rx checks invalid {int(p.safetyRxChecksInvalid)}, tx blocked {p.safetyTxBlocked}"
+    lines.append(f"panda: controls_allowed {int(p.controlsAllowed)}, rx invalid {p.safetyRxInvalid}, {checks}")
+  if decision is not None:
+    lines.append(decision.describe())
+  CS = _latest(rec, i, 'carState')
+  if CS is not None:
+    pedals = f"gasPressed {int(CS.gasPressed)}, brakePressed {int(CS.brakePressed)}"
+    lines.append(f"carState: {pedals}, standstill {int(CS.standstill)}, cruise enabled {int(CS.cruiseState.enabled)}, vEgo {CS.vEgo:.2f}")
+  CC = _latest(rec, i, 'carControl')
+  if CC is not None:
+    lines.append(f"carControl: enabled {int(CC.enabled)}, latActive {int(CC.latActive)}, longActive {int(CC.longActive)}")
+  return lines
+
+
+def _blocked_while_engaged(rec: Recording, mode: int, param: int, safety, why_not: str, dbcs: list[DBC]) -> Check:
+  # a block is a failure unless libsafety, fed the same rx, blocks it too right after its state changed, a transition
+  # openpilot reacts to a cycle later. without libsafety every block is
+  decisions = safety_decisions(rec, mode, param, safety) if safety is not None else {}
   failures = []
+  notes = []
   reported = set()
   commands = 0
   blocked = 0
+  transitions = 0
+  # frames the panda sent that libsafety blocks, libsafety's replay differs from the panda there
+  oracle_only = 0
   for i, msg in enumerate(rec.msgs):
     which = msg.which()
     if which not in ('can', 'sendcan') or not _judged_engaged(rec, i):
@@ -241,17 +398,39 @@ def _blocked_while_engaged(rec: Recording) -> Check:
     if which == 'sendcan':
       commands += len(msg.sendcan)
       continue
-    for frame in msg.can:
+    for k, frame in enumerate(msg.can):
+      decision = decisions.get((i, k))
+      if frame.src - ECHO_BASE in range(BUSES):
+        oracle_only += decision is not None and not decision.allowed
+        continue
       bus = frame.src - BLOCKED
       if bus not in range(BUSES):
         continue
       blocked += 1
+      if decision is not None and not decision.allowed and decision.since_change <= TRANSITION * DT:
+        transitions += 1
+        continue
       key = (rec.span_at(i), frame.address, bus)
-      if key not in reported:
-        reported.add(key)
-        t = rec.t(i)
-        failures.append((t, f"t={t:.2f} blocked while engaged, addr {frame.address:#x} bus {bus}"))
-  return Check(f"{commands} commands while engaged, {blocked} blocked by the panda", failures)
+      if key in reported:
+        continue
+      reported.add(key)
+      t = rec.t(i)
+      if safety is None:
+        reason = "not replayed through libsafety"
+      elif decision is None:
+        reason = "libsafety has no decision on it"
+      elif decision.allowed:
+        reason = "libsafety allows it"
+      else:
+        reason = "libsafety blocks it too, not at a transition"
+      failures.append((t, f"t={t:.2f} blocked while engaged, addr {frame.address:#x} bus {bus}, {reason}"))
+      notes += [f"t={t:.2f} {line}" for line in block_context(rec, i, frame, decision, dbcs)]
+  evidence = f"{commands} commands while engaged, {blocked} blocked by the panda"
+  if safety is None:
+    evidence += f", not replayed through libsafety, {why_not}" if why_not else ""
+  else:
+    evidence += f", {transitions} of them at a transition libsafety blocks too, {oracle_only} sent that libsafety blocks"
+  return Check(evidence, failures, notes)
 
 
 def _controls_allowed_dropped(rec: Recording) -> Check:
@@ -364,11 +543,25 @@ def _faults(rec: Recording) -> Check:
   return Check("new panda faults" if failures else "no new panda faults", failures)
 
 
-def rule_checks(msgs: list, mode: int, param: int, max_idle: int, start: int | None = None) -> list[Check]:
+def car_dbcs(car_model: str) -> list[DBC]:
+  # the DBCs the car's frames decode with, none for an unknown car
+  platform = PLATFORMS.get(car_model)
+  if platform is None:
+    return []
+  dbcs = []
+  for name in dict.fromkeys(platform.config.dbc_dict.values()):
+    with suppress(Exception):
+      dbcs.append(DBC(name))
+  return dbcs
+
+
+def rule_checks(msgs: list, mode: int, param: int, max_idle: int, start: int | None = None, safety=None, why_not: str = "",
+                car_model: str = "") -> list[Check]:
+  # safety: libsafety to replay the recording through, why_not: why there is none
   rec = _load(msgs, start)
   return [
     _not_engaged(rec),
-    _blocked_while_engaged(rec),
+    _blocked_while_engaged(rec, mode, param, safety, why_not, car_dbcs(car_model)),
     _commands_stopped(rec, max_idle),
     _controls_allowed_dropped(rec),
     _safety_pair(rec, mode, param),
@@ -381,8 +574,8 @@ def failure_lines(checks: list[Check]) -> list[str]:
   return [line for _, line in sorted(failures, key=lambda f: f[0])]
 
 
-def rule_failures(msgs: list, mode: int, param: int, max_idle: int, start: int | None = None) -> list[str]:
-  return failure_lines(rule_checks(msgs, mode, param, max_idle, start))
+def rule_failures(msgs: list, mode: int, param: int, max_idle: int, start: int | None = None, safety=None, why_not: str = "") -> list[str]:
+  return failure_lines(rule_checks(msgs, mode, param, max_idle, start, safety, why_not))
 
 
 def summary(msgs: list, start: int | None = None) -> str:

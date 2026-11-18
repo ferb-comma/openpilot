@@ -18,7 +18,7 @@ from openpilot.selfdrive.test.cars.scenario import LEAD, TAIL, Scenario
 ONROAD_LIMIT = 45.
 # subscribed this long before the recording window, so the states before its start are known
 PREROLL = 0.5
-RECORD = ('can', 'sendcan', 'pandaStates', 'selfdriveState', 'carState', 'onroadEvents', 'managerState')
+RECORD = ('can', 'sendcan', 'pandaStates', 'selfdriveState', 'carState', 'carControl', 'onroadEvents', 'managerState')
 # the panda marks its own tx echoes with src + 128
 ECHO = 128
 

@@ -4,7 +4,7 @@ import unittest
 from opendbc.car.structs import CarParams
 
 from openpilot.cereal.messaging import new_message
-from openpilot.selfdrive.test.cars.rules import is_event, log_line, rule_checks, rule_failures
+from openpilot.selfdrive.test.cars.rules import SAFETY_STATE, TRANSITION, is_event, log_line, rule_checks, rule_failures
 
 TOYOTA = int(CarParams.SafetyModel.toyota)
 
@@ -87,6 +87,36 @@ def failures(msgs, max_idle=0):
   return rule_failures(msgs, TOYOTA, 0, max_idle)
 
 
+GAS = 0x200
+
+
+class FakeSafety:
+  # libsafety that blocks every command once a gas frame came, or every command at all
+  def __init__(self, blocks_all=False):
+    self.blocks_all = blocks_all
+    self.gas = False
+
+  def set_safety_hooks(self, mode, param):
+    return 0
+
+  def safety_rx_hook(self, packet):
+    self.gas |= packet[0].addr == GAS
+
+  def safety_tx_hook(self, packet):
+    return not (self.gas or self.blocks_all)
+
+  def __getattr__(self, name):
+    if name == 'get_gas_pressed_prev':
+      return lambda: self.gas
+    if name.startswith('get_') and name[4:] in SAFETY_STATE:
+      return lambda: False
+    return lambda *args: None
+
+
+def oracle_failures(msgs, safety):
+  return rule_failures(msgs, TOYOTA, 0, 0, safety=safety)
+
+
 class TestRules(unittest.TestCase):
   def test_clean_drive(self):
     assert failures(clean_drive()) == []
@@ -106,7 +136,39 @@ class TestRules(unittest.TestCase):
     msgs = clean_drive()
     msgs.append(can_msg('can', 3.05, [(0x100, 192)]))
     blocked = rule_checks(msgs, TOYOTA, 0, 0)[1]
-    assert blocked.lines() == ["✗ 5 commands while engaged, 1 blocked by the panda", "  t=3.05 blocked while engaged, addr 0x100 bus 0"]
+    assert blocked.lines()[:2] == ["✗ 5 commands while engaged, 1 blocked by the panda",
+                                   "  t=3.05 blocked while engaged, addr 0x100 bus 0, not replayed through libsafety"]
+    assert "    t=3.05 frame: 0000000000000000 (no DBC describes it)" in blocked.lines()
+
+  def test_block_at_transition(self):
+    # the gas press reaches the panda in the cycle before the block, openpilot's command is from before it
+    msgs = clean_drive()
+    msgs.append(can_msg('can', 3.05, [(GAS, 0)]))
+    msgs.append(can_msg('can', 3.05 + (TRANSITION - 1) * 0.01, [(0x100, 192)]))
+    assert oracle_failures(msgs, FakeSafety()) == []
+    blocked = rule_checks(msgs, TOYOTA, 0, 0, safety=FakeSafety())[1]
+    assert "1 of them at a transition libsafety blocks too" in blocked.evidence
+
+  def test_block_long_after_transition(self):
+    msgs = clean_drive()
+    msgs.append(can_msg('can', 3.05, [(GAS, 0)]))
+    msgs.append(can_msg('can', 3.05 + (TRANSITION + 1) * 0.01, [(0x100, 192)]))
+    result = oracle_failures(msgs, FakeSafety())
+    assert result == ["t=3.09 blocked while engaged, addr 0x100 bus 0, libsafety blocks it too, not at a transition"]
+
+  def test_block_libsafety_allows(self):
+    msgs = clean_drive()
+    msgs.append(can_msg('can', 3.05, [(0x100, 192)]))
+    result = oracle_failures(msgs, FakeSafety())
+    assert result == ["t=3.05 blocked while engaged, addr 0x100 bus 0, libsafety allows it"]
+    notes = rule_checks(msgs, TOYOTA, 0, 0, safety=FakeSafety())[1].notes
+    assert any("libsafety allows it: controls_allowed 0" in note for note in notes)
+
+  def test_sent_libsafety_blocks(self):
+    msgs = clean_drive()
+    blocked = rule_checks(msgs, TOYOTA, 0, 0, safety=FakeSafety(blocks_all=True))[1]
+    assert blocked.failures == []
+    assert blocked.evidence.endswith("5 sent that libsafety blocks")
 
   def test_brake_disengage(self):
     # the panda drops controls and blocks commands, openpilot disengages right after

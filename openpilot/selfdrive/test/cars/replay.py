@@ -4,14 +4,14 @@ from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from opendbc.can.dbc import DBC, Msg, SignalType
+from opendbc.can.dbc import DBC, Msg
 from opendbc.can.packer import CANPacker
 from opendbc.car import gen_empty_fingerprint, structs
 from opendbc.car.can_definitions import CanData
 from opendbc.car.car_helpers import FRAME_FINGERPRINT, interfaces
 
 from openpilot.selfdrive.pandad import can_capnp_to_list
-from openpilot.selfdrive.test.cars.rules import BUSES
+from openpilot.selfdrive.test.cars.rules import BUSES, is_counter, signal_values
 from openpilot.selfdrive.test.cars.scenario import Fingerprint, RouteCar, Scenario, Window, load_scenario, safety_pair
 
 # the UP's can_replay frame period
@@ -103,24 +103,8 @@ def _dbcs(CP: structs.CarParams) -> dict[tuple[int, int], str]:
   return dbcs
 
 
-def _is_counter(sig) -> bool:
-  return sig.type == SignalType.COUNTER or sig.name == "COUNTER"
-
-
 def _checked(msg: Msg) -> bool:
-  return any(_is_counter(sig) or sig.calc_checksum is not None for sig in msg.sigs.values())
-
-
-def _values(msg: Msg, dat: bytes) -> dict[str, float]:
-  values = {}
-  for sig in msg.sigs.values():
-    if _is_counter(sig) or sig.calc_checksum is not None:
-      continue
-    raw = sig.get_raw_value(dat)
-    if sig.is_signed:
-      raw -= ((raw >> (sig.size - 1)) & 0x1) * (1 << sig.size)
-    values[sig.name] = raw * sig.factor + sig.offset
-  return values
+  return any(is_counter(sig) or sig.calc_checksum is not None for sig in msg.sigs.values())
 
 
 def _radar_trigger(CP: structs.CarParams) -> tuple[int, int] | None:
@@ -144,7 +128,7 @@ def _full_rate(dbcs: dict[tuple[int, int], str], parsed: dict[str, DBC], rx_chec
   if dbc is None:
     return True
   msg = parsed[dbc].addr_to_msg[key[1]]
-  return rx_checks[key] and not any(_is_counter(sig) for sig in msg.sigs.values())
+  return rx_checks[key] and not any(is_counter(sig) for sig in msg.sigs.values())
 
 
 def value_changes(frames: list[Frame], dbcs: dict[tuple[int, int], str], parsed: dict[str, DBC],
@@ -162,7 +146,7 @@ def value_changes(frames: list[Frame], dbcs: dict[tuple[int, int], str], parsed:
       dbc = dbcs.get(key)
       if dbc is None or key in full:
         continue
-      values = _values(parsed[dbc].addr_to_msg[addr], dat)
+      values = signal_values(parsed[dbc].addr_to_msg[addr], dat)
       if n:
         for name, value in values.items():
           if value != previous[key][name]:
@@ -222,7 +206,7 @@ def thin(CP: structs.CarParams, rx_checks: dict[tuple[int, int], bool], frames: 
       # a kept frame skips k - 1 counter steps, repack it so the counter and checksum stay consecutive
       if k > 1 and msg is not None and dbc is not None and _checked(msg):
         packer = packers.setdefault((bus, dbc), CANPacker(dbc))
-        addr, dat, bus = packer.make_can_msg(addr, bus, _values(msg, dat))
+        addr, dat, bus = packer.make_can_msg(addr, bus, signal_values(msg, dat))
       kept.append((addr, dat, bus))
     out.append(kept)
   return out
