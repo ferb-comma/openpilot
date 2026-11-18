@@ -81,7 +81,8 @@ class TestCars(OpenpilotTestCase):
     not_driven = sum(r.status == NOT_DRIVEN for r in cls.results)
     failed = len(cls.results) - passed - not_driven
     rig = f", {not_driven} not driven after a rig problem" if not_driven else ""
-    print(f"{passed} passed, {failed} failed{rig}, {len(gaps)} gaps (not driven), {(time.monotonic() - start) / 60:.1f} min", flush=True)
+    cls.summary = f"{passed} passed, {failed} failed{rig}, {len(gaps)} gaps (not driven), {(time.monotonic() - start) / 60:.1f} min"
+    print(cls.summary, flush=True)
 
   @staticmethod
   def drive_one(drive: Drive, result: DriveResult) -> None:
@@ -124,4 +125,9 @@ class TestCars(OpenpilotTestCase):
 
 
 if __name__ == "__main__":
-  unittest.main()
+  # unittest's tracebacks scroll the results away, so print them again last
+  program = unittest.main(exit=False)
+  for result in getattr(TestCars, "results", []):
+    print(result.line())
+  print(getattr(TestCars, "summary", ""), flush=True)
+  raise SystemExit(not program.result.wasSuccessful())
