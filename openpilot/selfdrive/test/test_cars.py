@@ -21,6 +21,13 @@ NOT_DRIVEN = "not driven"
 RIG_PROBLEM = "rig problem"
 
 
+def end_manager_output() -> None:
+  # the manager's last status line ends without a newline and leaves its color on, so ours start on a fresh line in default color
+  sys.stderr.flush()
+  sys.stdout.write("\x1b[0m\n")
+  sys.stdout.flush()
+
+
 def commit() -> str:
   return os.getenv("GIT_COMMIT") or subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=BASEDIR, encoding="utf-8").strip()
 
@@ -160,6 +167,7 @@ class TestCars(OpenpilotTestCase):
         else:
           print(f"=== {result.name} ===", flush=True)
           cls.drive_one(drive, result, current)
+          end_manager_output()
         print(result.line(), flush=True)
         print("\n".join(result.details()), flush=True)
         if result.status == "failed":
@@ -228,7 +236,7 @@ if __name__ == "__main__":
   # unittest's tracebacks scroll the results away, so the results are printed once, last, after its footer (also on stdout)
   program = unittest.main(testRunner=unittest.TextTestRunner(stream=sys.stdout), exit=False)
   sys.stdout.flush()
-  sys.stderr.flush()
+  end_manager_output()
   for result in getattr(TestCars, "results", []):
     print(result.line())
     if result.status != "passed":
