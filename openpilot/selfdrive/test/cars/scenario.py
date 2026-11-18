@@ -327,6 +327,8 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
   dut_gaps: dict[tuple[int, int], str] = {}
   # pairs with an engaged window whose route logged no commands in it
   no_commands: set[tuple[int, int]] = set()
+  # pairs with any engaged panda state in a segment searched
+  engaged_once: set[tuple[int, int]] = set()
   gaps = []
   # route -> segments loaded, and its pair if the DUT can drive it
   tried: dict[CarTestRoute, list[int]] = {}
@@ -365,6 +367,8 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
     drivable[route] = mode_param
     if not samples:
       return
+    if any(allowed for _, allowed in samples):
+      engaged_once.add(mode_param)
     picked = pick_window(samples, span)
     if picked is not None:
       window, rise = picked
@@ -396,8 +400,10 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
       gaps.append(f"mode {mode} param {param}: no {LEAD:g} s disengaged lead-in before the engage edge")
     elif (mode, param) in engaged_from_start:
       gaps.append(f"mode {mode} param {param}: no engage edge in any segment")
-    else:
+    elif (mode, param) in engaged_once:
       gaps.append(f"mode {mode} param {param}: no engaged stretch of {MIN_ENGAGED:g} s in any route")
+    else:
+      gaps.append(f"mode {mode} param {param}: never engaged in the segments of its routes searched")
   return scenarios, gaps
 
 
