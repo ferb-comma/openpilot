@@ -13,7 +13,7 @@ from opendbc.car import structs
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.logreader import LogReader as OpendbcLogReader
 from opendbc.car.tests.routes import CarTestRoute, routes as test_routes
-from opendbc.car.tests.test_models import COMMA_API_URL, TestCarModelBase, get_cached_segment
+from opendbc.car.tests.test_models import COMMA_API_URL, DOWNLOAD_CACHE_ROOT, TestCarModelBase, get_cached_segment
 from opendbc.car.vin import VIN_UNKNOWN
 from opendbc.safety.tests.libsafety import libsafety_py
 
@@ -248,6 +248,19 @@ def car_params(car_model: str, path: Path, msgs: list) -> RouteCar:
   return RouteCar(car_model, route_CP, dut_CP, cls.fingerprint, dut_fw, no_fw, cache, dut_long)
 
 
+def cached_segment(route: str, segment: int) -> Path:
+  # opendbc caches a log under a hash of its url, and the comma API's urls are signed, so they'd download again each run
+  stable = DOWNLOAD_CACHE_ROOT / f"cars_{route.replace('|', '_').replace('/', '_')}--{segment}"
+  if not stable.exists():
+    path = get_cached_segment(route, segment)
+    try:
+      path.replace(stable)
+    except FileNotFoundError:
+      # another worker moved the same download first
+      pass
+  return stable
+
+
 def read_log(path: Path) -> list:
   # a log from the comma API is cached under a name cut from its signed url, so read it by content
   return sorted(LogReader.from_bytes(path.read_bytes()), key=lambda m: m.logMonoTime)
@@ -255,7 +268,7 @@ def read_log(path: Path) -> list:
 
 def load_scenario(s: Scenario) -> tuple[RouteCar, list]:
   # the route's car, the replay is built for its DUT car params, and the log
-  path = get_cached_segment(s.route, s.segment)
+  path = cached_segment(s.route, s.segment)
   msgs = read_log(path)
   return car_params(s.car_model, path, msgs), msgs
 
@@ -275,7 +288,7 @@ RouteData = tuple[int, tuple[int, int], str, bool, float, list[tuple[float, bool
 
 
 def segment_data(route: CarTestRoute, segment: int) -> RouteData:
-  path = get_cached_segment(route.route, segment)
+  path = cached_segment(route.route, segment)
   msgs = read_log(path)
   car = car_params(str(route.car_model), path, msgs)
   return segment, safety_pair(car.CP), car.gap(), car.alpha_long, can_span(msgs), engaged_samples(msgs), sendcan_samples(msgs)
