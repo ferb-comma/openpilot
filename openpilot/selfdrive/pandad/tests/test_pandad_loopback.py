@@ -3,21 +3,27 @@
 import os
 import copy
 import random
+import subprocess
+import threading
 import time
 import unittest
 from collections import defaultdict
+from pathlib import Path
 from pprint import pprint
 
 from openpilot.common.test import OpenpilotTestCase
 import openpilot.cereal.messaging as messaging
 from openpilot.cereal import log
 from opendbc.car.structs import car
+from panda import Panda
 from opendbc.car.can_definitions import CanData
 from openpilot.common.utils import retry
 from openpilot.common.params import Params
+from openpilot.common.realtime import Priority
 from openpilot.common.timeout import Timeout
 from openpilot.selfdrive.pandad import can_list_to_can_capnp
 from openpilot.selfdrive.test.helpers import with_processes
+from openpilot.system.manager.process_config import managed_processes
 
 
 def publish_device_state(pm, started):
@@ -79,9 +85,21 @@ class TestBoarddLoopback(OpenpilotTestCase):
     os.environ['STARTED'] = '1'
     os.environ['BOARDD_LOOPBACK'] = '1'
 
-  @with_processes(['pandad'])
+  # the test stops pandad itself
+  @with_processes(['pandad'], ignore_stopped=['pandad'])
   def test_loopback(self):
     setup_pandad()
+
+    # the daemon is a child of the manager's process. its main loop is realtime, on the core that handles the SPI interrupt,
+    # and the send thread is one priority below it
+    proc = managed_processes['pandad'].proc
+    assert proc is not None
+    pid = int(subprocess.check_output(["pgrep", "-P", str(proc.pid)]))
+    send_tid = next(int(t.name) for t in Path(f"/proc/{pid}/task").iterdir() if (t / "comm").read_text().strip() == "pandad_can_send")
+    for tid, prio in ((pid, Priority.PANDAD), (send_tid, Priority.PANDAD_CAN_SEND)):
+      assert os.sched_getscheduler(tid) == os.SCHED_FIFO
+      assert os.sched_getparam(tid).sched_priority == prio
+      assert os.sched_getaffinity(tid) == {3}
 
     sendcan = messaging.pub_sock('sendcan')
     can = messaging.sub_sock('can', conflate=False, timeout=100)
@@ -117,6 +135,22 @@ class TestBoarddLoopback(OpenpilotTestCase):
       pprint(sm['pandaStates'])  # may drop messages due to RX buffer overflow
       for bus in sent_loopback.keys():
         assert not len(sent_loopback[bus]), f"loop {i}: bus {bus} missing {len(sent_loopback[bus])} out of {sent_total[bus]} messages"
+
+    # SIGINT: a clean exit (not a SIGKILL after the timeout) that closes the relay, since we're onroad and not engaged.
+    # the heartbeat keeps the panda from going SILENT on its own (1-2 s without one), it never changes the safety mode
+    with Panda(Panda.spi_list()[0], cli=False, disable_checks=False) as p:
+      stopped = threading.Event()
+      def heartbeat():
+        while not stopped.wait(0.1):
+          p.send_heartbeat(False)
+      t = threading.Thread(target=heartbeat)
+      t.start()
+      try:
+        assert managed_processes['pandad'].stop() == 0
+        assert p.health()['safety_mode'] == car.CarParams.SafetyModel.noOutput
+      finally:
+        stopped.set()
+        t.join()
 
 
 if __name__ == "__main__":

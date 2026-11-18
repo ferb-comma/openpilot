@@ -24,7 +24,8 @@ class Priority:
   CTRL_LOW = 51 # plannerd & radard
 
   # CORE 3
-  # - pandad = 55
+  PANDAD = 54
+  PANDAD_CAN_SEND = 53
   CTRL_HIGH = 53
 
 
@@ -38,10 +39,15 @@ def set_core_affinity(cores: list[int]) -> None:
     os.sched_setaffinity(0, cores)
 
 
+def set_realtime_priority(level: int) -> None:
+  """SCHED_FIFO for the calling thread"""
+  if sys.platform == 'linux' and not PC:
+    os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(level))
+
+
 def config_realtime_process(cores: int | list[int], priority: int) -> None:
   gc.disable()
-  if sys.platform == 'linux' and not PC:
-    os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(priority))
+  set_realtime_priority(priority)
   c = cores if isinstance(cores, list) else [cores, ]
   set_core_affinity(c)
 

@@ -74,7 +74,7 @@ PROCS = {
   "openpilot.selfdrive.pandad.pandad": 0,
   "openpilot.system.loggerd.uploader": 15.0,
   "openpilot.system.loggerd.deleter": 1.0,
-  "./pandad": 40.0,
+  "pandad": 40.0,
   "openpilot.system.qcomgpsd.qcomgpsd": 1.0,
   "openpilot.system.ubloxd.ubloxd": 2.0,
   "openpilot.system.ubloxd.pigeond": 5.0,

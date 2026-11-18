@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import os
+import signal
+import subprocess
 import time
 import unittest
 
@@ -89,6 +91,56 @@ class TestPandad(OpenpilotTestCase):
     assert not PandaDFU.list()
 
     self._run_test()
+
+  def test_daemon_crash(self):
+    # a hard crash of the daemon (a native abort, or here a SIGKILL) gets the panda reset and the daemon restarted
+    sock = messaging.sub_sock('pandaStates', timeout=100)
+    managed_processes['pandad'].start()
+    daemons = []
+    for _ in range(3):
+      # from the new daemon, not queued from the old one
+      messaging.drain_sock(sock)
+      self._wait_for_state(sock)
+      daemons.append(self._daemon_pid())
+      os.kill(daemons[-1], signal.SIGKILL)
+      time.sleep(0.1)
+    assert len(set(daemons)) == len(daemons)
+    # the supervisor is still running
+    proc = managed_processes['pandad'].proc
+    assert proc is not None and proc.exitcode is None
+
+  def _supervisor_pid(self) -> int:
+    proc = managed_processes['pandad'].proc
+    assert proc is not None and proc.pid is not None
+    return proc.pid
+
+  def _daemon_pid(self) -> int:
+    return int(subprocess.check_output(["pgrep", "-P", str(self._supervisor_pid())]))
+
+  def _wait_for_state(self, sock, timeout=30):
+    # the latest pandaState from a connected panda, not the oldest one queued
+    st = time.monotonic()
+    while time.monotonic() - st < timeout:
+      for msg in reversed(messaging.drain_sock(sock, wait_for_one=True)):
+        if msg.pandaStates[0].pandaType != log.PandaState.PandaType.unknown:
+          return msg.pandaStates[0]
+    raise AssertionError("no pandaStates")
+
+  def test_bootstub_while_running(self):
+    # the panda drops into its bootstub mid-run. pandad can't read its state anymore, so it resets it and comes back
+    sock = messaging.sub_sock('pandaStates', timeout=100)
+    managed_processes['pandad'].start()
+    self._wait_for_state(sock)
+    time.sleep(2)
+    uptime = self._wait_for_state(sock).uptime
+    daemon = self._daemon_pid()
+
+    with Panda(Panda.spi_list()[0], cli=False, disable_checks=False) as p:
+      p.reset(enter_bootstub=True, reconnect=False)
+    st = time.monotonic()
+    while self._wait_for_state(sock, 15).uptime >= uptime:
+      assert time.monotonic() - st < 15, "pandad didn't reset the panda"
+    assert self._daemon_pid() != daemon
 
 
 if __name__ == "__main__":

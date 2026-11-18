@@ -112,7 +112,7 @@ class HardwareComma(HardwareBase):
     if self.get_device_type() == "tizi":
       return
 
-    value = int((percent / 100) * 300)
+    value = min(max(percent, 0), 100) * 300 // 100
     with open("/sys/class/leds/led:switch_2/brightness", "w") as f:
       f.write("0\n")
     with open("/sys/class/leds/led:torch_2/brightness", "w") as f:
