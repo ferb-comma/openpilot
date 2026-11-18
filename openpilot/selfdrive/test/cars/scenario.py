@@ -161,11 +161,20 @@ def load_route(route: CarTestRoute) -> tuple[int, tuple[structs.CarParams, struc
   raise OSError("; ".join(errors))
 
 
-def read_route(route: CarTestRoute) -> tuple[int, tuple[int, int], tuple[int, int], bool, float, list[tuple[float, bool]]] | Exception:
+def dashcam_only_on_rack(CP: structs.CarParams) -> str:
+  # why card would make these car params dashcam only on a rack device, which has no SecOC key
+  if CP.dashcamOnly:
+    return "dashcam only without firmware"
+  if CP.secOcRequired and not CP.secOcKeyAvailable:
+    return "dashcam only on the rack: SecOC without a key"
+  return ""
+
+
+def read_route(route: CarTestRoute) -> tuple[int, tuple[int, int], tuple[int, int], str, float, list[tuple[float, bool]]] | Exception:
   # the picklable part of a route's load, run in a worker, a failure comes back as the exception
   try:
     segment, (CP, dut_CP), msgs = load_route(route)
-    return segment, safety_pair(CP), safety_pair(dut_CP), dut_CP.dashcamOnly, can_span(msgs), engaged_samples(msgs)
+    return segment, safety_pair(CP), safety_pair(dut_CP), dashcam_only_on_rack(dut_CP), can_span(msgs), engaged_samples(msgs)
   except Exception as e:
     return e
 
@@ -178,8 +187,8 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
   no_lead_in: set[tuple[int, int]] = set()
   # pair -> the DUT's pair without firmware, when they differ
   needs_fw: dict[tuple[int, int], tuple[int, int]] = {}
-  # pairs whose DUT car params are dashcamOnly without firmware
-  dashcam_only: set[tuple[int, int]] = set()
+  # pairs whose DUT car params are dashcam only, and why
+  dashcam_only: dict[tuple[int, int], str] = {}
   gaps = []
   with ProcessPoolExecutor(os.cpu_count(), mp_context=multiprocessing.get_context("spawn")) as pool:
     loaded = list(pool.map(read_route, routes))
@@ -189,7 +198,7 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
       gaps.append(f"{who}: can't load ({result})")
       continue
 
-    segment, mode_param, dut_pair, dut_dashcam, span, samples = result
+    segment, mode_param, dut_pair, dut_dashcam_why, span, samples = result
     if span < LENGTH:
       gaps.append(f"{who}: segment shorter than {LENGTH:g} s")
       continue
@@ -202,8 +211,8 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
     if dut_pair != mode_param:
       needs_fw[mode_param] = dut_pair
       continue
-    if dut_dashcam:
-      dashcam_only.add(mode_param)
+    if dut_dashcam_why:
+      dashcam_only[mode_param] = dut_dashcam_why
       continue
 
     if not samples:
@@ -223,7 +232,7 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
     if (mode, param) in needs_fw:
       gaps.append(f"mode {mode} param {param}: param depends on firmware: {needs_fw[(mode, param)]} != {(mode, param)}")
     elif (mode, param) in dashcam_only:
-      gaps.append(f"mode {mode} param {param}: dashcam only without firmware")
+      gaps.append(f"mode {mode} param {param}: {dashcam_only[(mode, param)]}")
     elif (mode, param) in no_lead_in:
       gaps.append(f"mode {mode} param {param}: no {LEAD:g} s disengaged lead-in before the engage edge")
     elif (mode, param) in engaged_from_start:
