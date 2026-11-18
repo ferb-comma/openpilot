@@ -123,10 +123,14 @@ def rx_checks(mode: int, param: int) -> dict[tuple[int, int], bool]:
   return checks
 
 
-def car_params(car_model: str, path: Path) -> structs.CarParams:
+def car_params(car_model: str, path: Path) -> tuple[structs.CarParams, structs.CarParams]:
+  # the route's car params, and the DUT's: SKIP_FW_QUERY leaves no firmware and the alpha long toggle is unset
   cls = type("R", (TestCarModelBase,), {"platform": car_model})
   car_fw, _, alpha_long = cls.get_testing_data_from_logreader(OpendbcLogReader(str(path), only_union_types=True, sort_by_time=True))
-  return interfaces[cls.platform].get_params(cls.platform, cls.fingerprint, car_fw, alpha_long, False, docs=False)
+  get_params = interfaces[cls.platform].get_params
+  route_CP = get_params(cls.platform, cls.fingerprint, car_fw, alpha_long, False, docs=False)
+  dut_CP = get_params(cls.platform, cls.fingerprint, [], False, False, docs=False)
+  return route_CP, dut_CP
 
 
 def read_log(path: Path) -> list:
@@ -137,10 +141,10 @@ def read_log(path: Path) -> list:
 def load_scenario(s: Scenario) -> tuple[structs.CarParams, list]:
   # the scenario's log and the car params thinning repacks with, one route's worth of work
   path = get_cached_segment(s.route, s.segment)
-  return car_params(s.car_model, path), read_log(path)
+  return car_params(s.car_model, path)[0], read_log(path)
 
 
-def load_route(route: CarTestRoute) -> tuple[int, structs.CarParams, list]:
+def load_route(route: CarTestRoute) -> tuple[int, tuple[structs.CarParams, structs.CarParams], list]:
   segments = (2, 1, 0) if route.segment is None else (route.segment,)
   errors = []
   for segment in segments:
@@ -157,11 +161,11 @@ def load_route(route: CarTestRoute) -> tuple[int, structs.CarParams, list]:
   raise OSError("; ".join(errors))
 
 
-def read_route(route: CarTestRoute) -> tuple[int, tuple[int, int], float, list[tuple[float, bool]]] | Exception:
+def read_route(route: CarTestRoute) -> tuple[int, tuple[int, int], tuple[int, int], float, list[tuple[float, bool]]] | Exception:
   # the picklable part of a route's load, run in a worker, a failure comes back as the exception
   try:
-    segment, CP, msgs = load_route(route)
-    return segment, safety_pair(CP), can_span(msgs), engaged_samples(msgs)
+    segment, (CP, dut_CP), msgs = load_route(route)
+    return segment, safety_pair(CP), safety_pair(dut_CP), can_span(msgs), engaged_samples(msgs)
   except Exception as e:
     return e
 
@@ -172,6 +176,8 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
   seen_pairs: set[tuple[int, int]] = set()
   engaged_from_start: set[tuple[int, int]] = set()
   no_lead_in: set[tuple[int, int]] = set()
+  # pair -> the DUT's pair without firmware, when they differ
+  needs_fw: dict[tuple[int, int], tuple[int, int]] = {}
   gaps = []
   with ProcessPoolExecutor(os.cpu_count(), mp_context=multiprocessing.get_context("spawn")) as pool:
     loaded = list(pool.map(read_route, routes))
@@ -181,7 +187,7 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
       gaps.append(f"{who}: can't load ({result})")
       continue
 
-    segment, mode_param, span, samples = result
+    segment, mode_param, dut_pair, span, samples = result
     if span < LENGTH:
       gaps.append(f"{who}: segment shorter than {LENGTH:g} s")
       continue
@@ -191,6 +197,9 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
       gaps.append(f"{who}: {e}")
       continue
     seen_pairs.add(mode_param)
+    if dut_pair != mode_param:
+      needs_fw[mode_param] = dut_pair
+      continue
 
     if not samples:
       gaps.append(f"{who}: no panda state logged")
@@ -206,7 +215,9 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
       engaged_from_start.add(mode_param)
 
   for mode, param in sorted(seen_pairs - scenarios.keys()):
-    if (mode, param) in no_lead_in:
+    if (mode, param) in needs_fw:
+      gaps.append(f"mode {mode} param {param}: param depends on firmware: {needs_fw[(mode, param)]} != {(mode, param)}")
+    elif (mode, param) in no_lead_in:
       gaps.append(f"mode {mode} param {param}: no {LEAD:g} s disengaged lead-in before the engage edge")
     elif (mode, param) in engaged_from_start:
       gaps.append(f"mode {mode} param {param}: no engage edge in segment")
