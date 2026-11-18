@@ -128,6 +128,18 @@ def log_line(text: str) -> str:
   return line[:LOG_LINE_LIMIT]
 
 
+def fingerprinted(msgs: list) -> str:
+  # card's fingerprinted record, how it got its car model and firmware
+  for msg in msgs:
+    if msg.which() != 'errorLogMessage':
+      continue
+    log = log_record(msg.errorLogMessage).get('msg')
+    if isinstance(log, dict) and log.get('event') == 'fingerprinted':
+      source = log.get('source')
+      return f"card: fingerprinted {log.get('car_fingerprint')} from {source}, cached firmware {log.get('cached')}, {log.get('fw_count')} carFw entries"
+  return "card: no fingerprinted record"
+
+
 def _comm_issue(log: dict | None) -> str:
   # the services selfdrived logs with its commIssue event
   if log is None:

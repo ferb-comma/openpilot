@@ -12,6 +12,7 @@ from opendbc.car.car_helpers import interfaces
 from opendbc.car.logreader import LogReader as OpendbcLogReader
 from opendbc.car.tests.routes import CarTestRoute, routes as test_routes
 from opendbc.car.tests.test_models import TestCarModelBase, get_cached_segment
+from opendbc.car.vin import VIN_UNKNOWN
 from opendbc.safety.tests.libsafety import libsafety_py
 
 from openpilot.tools.lib.logreader import LogReader
@@ -160,17 +161,78 @@ def rx_checks(mode: int, param: int) -> dict[tuple[int, int], bool]:
 Fingerprint = dict[int, dict[int, int]]
 
 
-def dut_params(car_model: str, fingerprint: Fingerprint) -> structs.CarParams:
-  # SKIP_FW_QUERY leaves no firmware and the alpha long toggle is unset
-  return interfaces[car_model].get_params(car_model, fingerprint, [], False, False, docs=False)
+def dut_params(car_model: str, fingerprint: Fingerprint, car_fw: list) -> structs.CarParams:
+  # as card derives them with FINGERPRINT set, the alpha long toggle unset and not a release branch
+  return interfaces[car_model].get_params(car_model, fingerprint, car_fw, False, False, docs=False)
 
 
-def car_params(car_model: str, path: Path) -> tuple[structs.CarParams, structs.CarParams, Fingerprint]:
-  # the route's car params, the DUT's on the route's fingerprint, and the fingerprint
+def logged_car_params(msgs: list):
+  # the route's last logged car params, as the opendbc tests take its firmware
+  return next((m.carParams for m in reversed(msgs) if m.which() == 'carParams'), None)
+
+
+def cached_fw(logged) -> tuple[list, str]:
+  # the firmware card takes from a CarParamsCache of the route's car params instead of querying (car_helpers fingerprint()),
+  # and why it takes none. REPLAY would lift the VIN check, but it also changes how selfdrived engages and card's clock
+  if logged is None:
+    return [], "route logged no car params"
+  if logged.brand == "mock":
+    return [], "route's car params are mock"
+  if not len(logged.carFw):
+    return [], "route logged no firmware"
+  if logged.carVin == VIN_UNKNOWN:
+    return [], "route's VIN is unknown, card doesn't use cached firmware without one"
+  return list(logged.carFw), ""
+
+
+@dataclass
+class RouteCar:
+  car_model: str
+  # the route's car params, and the DUT's on the route's fingerprint and the firmware it takes from the cache
+  CP: structs.CarParams
+  dut_CP: structs.CarParams
+  fingerprint: Fingerprint
+  dut_fw: list
+  # why the DUT takes no firmware from the cache, empty if it does
+  no_fw: str
+  # the route's logged car params for CarParamsCache, None if card wouldn't use them
+  cache: bytes | None
+  # the route drove with openpilot longitudinal
+  alpha_long: bool
+
+  def dut(self, fingerprint: Fingerprint) -> structs.CarParams:
+    # the DUT's car params on another fingerprint
+    return dut_params(self.car_model, fingerprint, self.dut_fw)
+
+  def gap(self) -> str:
+    # why the DUT can't drive the route's safety pair, empty if it can
+    pair = safety_pair(self.CP)
+    dut_pair = safety_pair(self.dut_CP)
+    if self.CP.dashcamOnly:
+      return "dashcam only in opendbc"
+    if dut_pair == pair and not self.dut_CP.dashcamOnly:
+      return ""
+    # what the DUT's car params need besides its firmware: the alpha long toggle the route drove with
+    with_long = interfaces[self.car_model].get_params(self.car_model, self.fingerprint, self.dut_fw, self.alpha_long, False, docs=False)
+    if self.alpha_long and safety_pair(with_long) == pair and not with_long.dashcamOnly:
+      what = "the route drove with openpilot longitudinal, the DUT has AlphaLongitudinalEnabled off"
+    elif self.no_fw:
+      what = f"depends on firmware, {self.no_fw}"
+    else:
+      what = "the DUT's car params differ with the route's firmware"
+    if self.dut_CP.dashcamOnly:
+      return f"dashcam only on the DUT, {what}"
+    return f"param {what}: {dut_pair} != {pair}"
+
+
+def car_params(car_model: str, path: Path, msgs: list) -> RouteCar:
   cls = type("R", (TestCarModelBase,), {"platform": car_model})
   car_fw, _, alpha_long = cls.get_testing_data_from_logreader(OpendbcLogReader(str(path), only_union_types=True, sort_by_time=True))
   route_CP = interfaces[cls.platform].get_params(cls.platform, cls.fingerprint, car_fw, alpha_long, False, docs=False)
-  return route_CP, dut_params(cls.platform, cls.fingerprint), cls.fingerprint
+  logged = logged_car_params(msgs)
+  dut_fw, no_fw = cached_fw(logged)
+  cache = logged.as_builder().to_bytes() if dut_fw else None
+  return RouteCar(car_model, route_CP, dut_params(cls.platform, cls.fingerprint, dut_fw), cls.fingerprint, dut_fw, no_fw, cache, alpha_long)
 
 
 def read_log(path: Path) -> list:
@@ -178,14 +240,14 @@ def read_log(path: Path) -> list:
   return sorted(LogReader.from_bytes(path.read_bytes()), key=lambda m: m.logMonoTime)
 
 
-def load_scenario(s: Scenario) -> tuple[structs.CarParams, Fingerprint, list]:
-  # the DUT's car params on the route's fingerprint, which the replay is built for, the fingerprint and the log
+def load_scenario(s: Scenario) -> tuple[RouteCar, list]:
+  # the route's car, the replay is built for its DUT car params, and the log
   path = get_cached_segment(s.route, s.segment)
-  _, CP, fingerprint = car_params(s.car_model, path)
-  return CP, fingerprint, read_log(path)
+  msgs = read_log(path)
+  return car_params(s.car_model, path, msgs), msgs
 
 
-def load_route(route: CarTestRoute) -> tuple[int, tuple[structs.CarParams, structs.CarParams, Fingerprint], list]:
+def load_route(route: CarTestRoute) -> tuple[int, RouteCar, list]:
   segments = (2, 1, 0) if route.segment is None else (route.segment,)
   errors = []
   for segment in segments:
@@ -196,20 +258,20 @@ def load_route(route: CarTestRoute) -> tuple[int, tuple[structs.CarParams, struc
       errors.append(f"segment {segment}: {e!r}")
       continue
     try:
-      return segment, car_params(str(route.car_model), path), msgs
+      return segment, car_params(str(route.car_model), path, msgs), msgs
     except Exception as e:
       errors.append(f"segment {segment}: can't derive safety config: {e!r}")
   raise OSError("; ".join(errors))
 
 
-RouteData = tuple[int, tuple[int, int], tuple[int, int], bool, float, list[tuple[float, bool]], list[tuple[float, bool]]]
+RouteData = tuple[int, tuple[int, int], str, float, list[tuple[float, bool]], list[tuple[float, bool]]]
 
 
 def read_route(route: CarTestRoute) -> RouteData | Exception:
   # the picklable part of a route's load, run in a worker, a failure comes back as the exception
   try:
-    segment, (CP, dut_CP, _), msgs = load_route(route)
-    return segment, safety_pair(CP), safety_pair(dut_CP), dut_CP.dashcamOnly, can_span(msgs), engaged_samples(msgs), sendcan_samples(msgs)
+    segment, car, msgs = load_route(route)
+    return segment, safety_pair(car.CP), car.gap(), can_span(msgs), engaged_samples(msgs), sendcan_samples(msgs)
   except Exception as e:
     return e
 
@@ -220,10 +282,8 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
   seen_pairs: set[tuple[int, int]] = set()
   engaged_from_start: set[tuple[int, int]] = set()
   no_lead_in: set[tuple[int, int]] = set()
-  # pair -> the DUT's pair without firmware, when they differ
-  needs_fw: dict[tuple[int, int], tuple[int, int]] = {}
-  # pairs whose DUT car params are dashcamOnly without firmware
-  dashcam_only: set[tuple[int, int]] = set()
+  # pair -> why the DUT can't drive it
+  dut_gaps: dict[tuple[int, int], str] = {}
   # pairs with an engaged window whose route logged no commands in it
   no_commands: set[tuple[int, int]] = set()
   gaps = []
@@ -235,7 +295,7 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
       gaps.append(f"{who}: can't load ({result})")
       continue
 
-    segment, mode_param, dut_pair, dut_dashcam, span, samples, sendcan = result
+    segment, mode_param, dut_gap, span, samples, sendcan = result
     if span < LENGTH:
       gaps.append(f"{who}: segment shorter than {LENGTH:g} s")
       continue
@@ -245,11 +305,8 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
       gaps.append(f"{who}: {e}")
       continue
     seen_pairs.add(mode_param)
-    if dut_pair != mode_param:
-      needs_fw[mode_param] = dut_pair
-      continue
-    if dut_dashcam:
-      dashcam_only.add(mode_param)
+    if dut_gap:
+      dut_gaps[mode_param] = dut_gap
       continue
 
     if not samples:
@@ -270,10 +327,8 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
       engaged_from_start.add(mode_param)
 
   for mode, param in sorted(seen_pairs - scenarios.keys()):
-    if (mode, param) in needs_fw:
-      gaps.append(f"mode {mode} param {param}: param depends on firmware: {needs_fw[(mode, param)]} != {(mode, param)}")
-    elif (mode, param) in dashcam_only:
-      gaps.append(f"mode {mode} param {param}: dashcam only without firmware")
+    if (mode, param) in dut_gaps:
+      gaps.append(f"mode {mode} param {param}: {dut_gaps[(mode, param)]}")
     elif (mode, param) in no_commands:
       gaps.append(f"mode {mode} param {param}: no logged commands in the engaged window")
     elif (mode, param) in no_lead_in:

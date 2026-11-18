@@ -112,18 +112,21 @@ class Drive:
     except Exception as e:
       raise RigProblem(f"rig problem: UP {call} failed: {e!r}") from e
 
-  def _start_manager(self, scenario: Scenario) -> None:
+  def _start_manager(self, scenario: Scenario, replay: Replay) -> None:
     set_params_enabled()
     # calibrationd drops the seeded calibration when the previous route was another car, so no previous car
     params = Params()
     params.remove("CarParamsPersistent")
     params.remove("CarParamsPrevRoute")
+    # FINGERPRINT also wins over a cached firmware match, so the car model doesn't depend on fuzzy firmware matching
     env = os.environ | {
       'FINGERPRINT': scenario.car_model,
-      'SKIP_FW_QUERY': '1',
       'TESTING_CLOSET': '1',
       'BLOCK': 'soundd',
     }
+    # without the route's firmware card would query the UP, which doesn't answer
+    if replay.cache is None:
+      env['SKIP_FW_QUERY'] = '1'
     # its own process group, so stopping it leaves no processes for the next scenario, its output goes to ours
     self._started = time.monotonic()
     self._manager = subprocess.Popen(["python", os.path.join(BASEDIR, "openpilot/system/manager/manager.py")], env=env, start_new_session=True)
@@ -225,12 +228,15 @@ class Drive:
     # every error since openpilot started, not just the recording window's
     error_sock = messaging.sub_sock('errorLogMessage', conflate=False)
     errors: list = []
-    self._start_manager(scenario)
+    self._start_manager(scenario, replay)
     try:
       self._up('reset')
       self._up('set_ignition', True)
       # the station's lanes start classic, a CAN FD bus gets the data speed the DUT's panda is set to
       panda = self._wait_panda(sm)
+      # pandad runs after manager start cleared CarParamsCache, and card reads it on the first CAN, which comes with can_replay
+      if replay.cache is not None:
+        Params().put("CarParamsCache", replay.cache)
       can_states = (panda.canState0, panda.canState1, panda.canState2)
       for bus in fd_buses(frames):
         self._up('set_can_data_speed_kbps', bus, can_states[bus].canDataSpeed)

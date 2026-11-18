@@ -14,7 +14,7 @@ from openpilot.common.basedir import BASEDIR
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.test.cars.drive import Drive, DriveFailed, RigProblem
 from openpilot.selfdrive.test.cars.replay import BUDGET, Replay, scenario_replay
-from openpilot.selfdrive.test.cars.rules import SAFETY_MODELS, Check, failure_lines, rule_checks, summary
+from openpilot.selfdrive.test.cars.rules import SAFETY_MODELS, Check, failure_lines, fingerprinted, rule_checks, summary
 from openpilot.selfdrive.test.cars.scenario import Scenario, load_scenarios
 
 NOT_DRIVEN = "not driven"
@@ -47,6 +47,8 @@ class DriveResult:
   checks: list[Check] | None = None
   replay: Replay | None = None
   stats: str = ""
+  # card's fingerprinted record
+  fingerprinted: str = ""
   took: float = 0.
   # seconds of each phase of the drive
   timing: dict[str, float] = field(default_factory=dict)
@@ -88,6 +90,9 @@ class DriveResult:
     lines = [f"route {s.route} segment {s.segment}, window {s.window.start:.1f}-{s.window.end:.1f} s, panda engage edge at {s.rise:.1f} s"]
     if self.replay is not None:
       lines.append(self.replay.describe(BUDGET))
+      lines.append(self.replay.firmware())
+    if self.fingerprinted:
+      lines.append(self.fingerprinted)
     if self.error:
       lines += self.error.splitlines()
     for check in self.checks or []:
@@ -183,6 +188,7 @@ class TestCars(OpenpilotTestCase):
       result.checks = rule_checks(log.msgs, s.mode, s.param, s.max_idle, start=log.start)
       result.failures = failure_lines(result.checks)
       result.stats = summary(log.msgs, start=log.start)
+      result.fingerprinted = fingerprinted(log.msgs)
       result.status = "passed" if not result.failures else "failed"
     except RigProblem as e:
       result.status = RIG_PROBLEM
