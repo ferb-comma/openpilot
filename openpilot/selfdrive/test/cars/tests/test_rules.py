@@ -89,6 +89,16 @@ def cadence_drive(every, duration=3.):
   return msgs
 
 
+def stopped_drive():
+  # commands until 4 s, then card publishes empty sendcan every cycle from 5 s with openpilot still engaged
+  msgs = clean_drive(3.)
+  for i in range(12):
+    t = 5. + i * 0.01
+    msgs += [can_msg('sendcan', t, []), selfdrive_state(t + 0.002, True)]
+  msgs.append(selfdrive_state(5.2, False))
+  return msgs
+
+
 def failures(msgs, max_idle=0):
   return rule_failures(msgs, TOYOTA, 0, max_idle)
 
@@ -132,7 +142,7 @@ class TestRules(unittest.TestCase):
     assert lines == [
       "✓ engaged at the panda's controls_allowed edge (t=1.00, 0.50 s after)",
       "✓ 5 commands while engaged, 0 blocked by the panda",
-      "✓ commands never idle more than 0 cycles (route max 0, 1 of jitter)",
+      "✓ commands never idle more than 0 cycles (route max 0, stopped after 9)",
       "✓ controls_allowed held while engaged (5 panda states)",
       "✓ safety mode toyota param 0 = scenario",
       "✓ no new panda faults",
@@ -284,9 +294,9 @@ class TestRules(unittest.TestCase):
     assert "blocked while engaged" in result[0]
 
   def test_commands_stop(self):
-    result = failures(idle(clean_drive(8.), since=5.))
+    result = failures(idle(cadence_drive(1, 4.), since=3.))
     assert len(result) == 1
-    assert "commands stopped" in result[0]
+    assert "commands stopped while engaged, 10 cycles idle" in result[0]
 
   def test_commands_stop_before_disengage(self):
     msgs = clean_drive(3.)
@@ -294,13 +304,9 @@ class TestRules(unittest.TestCase):
     assert failures(msgs) == []
 
   def test_commands_stop_stays_engaged(self):
-    msgs = clean_drive(3.)
-    for i in range(3):
-      msgs += [can_msg('sendcan', 5. + i, []), selfdrive_state(5.02 + i, True)]
-    msgs.append(selfdrive_state(8.02, False))
-    result = failures(msgs)
+    result = failures(stopped_drive())
     assert len(result) == 1
-    assert result[0].startswith("t=6.02 commands stopped")
+    assert result[0].startswith("t=5.09 commands stopped")
 
   def test_commands_start_late(self):
     # no command in the first two samples of the span
@@ -320,7 +326,9 @@ class TestRules(unittest.TestCase):
     assert "no commands while engaged" in result[0]
 
   def test_commands_start_then_stop(self):
-    result = failures(idle(clean_drive(8.), since=5.))
+    # a stop shorter than a lost command stream is the controller's cadence
+    assert failures(idle(cadence_drive(1, 4.), since=3., until=3.09)) == []
+    result = failures(idle(cadence_drive(1, 4.), since=3., until=3.1))
     assert len(result) == 1
     assert "commands stopped while engaged" in result[0]
 
@@ -333,23 +341,24 @@ class TestRules(unittest.TestCase):
     assert failures(cadence_drive(2), max_idle=0) == []
 
   def test_commands_33hz_cadence_at_100hz(self):
-    result = failures(cadence_drive(3), max_idle=0)
-    assert len(result) == 1
-    assert "commands stopped while engaged, 2 cycles idle" in result[0]
+    # a controller that sends less often than on its route, as GM's waits for its loopback, still sends
+    assert failures(cadence_drive(3), max_idle=0) == []
+
+  def test_commands_loopback_cadence(self):
+    # GM's 33 Hz steering held back a few cycles more when its loopback came late
+    msgs = cadence_drive(3, 4.)
+    msgs = idle(msgs, since=3., until=3.05)
+    assert failures(msgs, max_idle=2) == []
 
   def test_commands_stop_context(self):
-    msgs = clean_drive(3.)
-    for i in range(3):
-      msgs += [can_msg('sendcan', 5. + i, []), selfdrive_state(5.02 + i, True)]
-    msgs.append(selfdrive_state(8.02, False))
-    notes = rule_checks(msgs, TOYOTA, 0, 0)[2].notes
-    assert notes[0] == "t=6.02 idle 2000 ms since the command at t=4.00"
-    assert notes[1] == "t=6.02 sendcan: 3 in it, gaps 1000-1000 ms"
+    notes = rule_checks(stopped_drive(), TOYOTA, 0, 0)[2].notes
+    assert notes[0] == "t=5.09 idle 1090 ms since the command at t=4.00"
+    assert notes[1] == "t=5.09 sendcan: 11 in it, gaps 10-1000 ms"
 
   def test_commands_50hz_cadence_stop(self):
     result = failures(idle(cadence_drive(2, 4.), since=3.), max_idle=1)
     assert len(result) == 1
-    assert result[0].startswith("t=3.01 commands stopped while engaged")
+    assert result[0].startswith("t=3.18 commands stopped while engaged, 20 cycles idle")
 
 
 

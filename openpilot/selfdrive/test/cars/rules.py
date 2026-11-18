@@ -33,12 +33,13 @@ DT = 0.01
 # controlsd made from the previous carState, so a command up to two cycles after the edge still comes from before it,
 # and a recording's can message carries its frames at the time pandad read them, up to a cycle late
 TRANSITION = 3
-# a controller whose cadence depends on wall time (GM skips a steering message whose loopback came back too recently)
-# may idle a cycle more than on the route when card's cycles jitter, commands stopped is a longer run
-IDLE_JITTER = 1
-# libsafety's state the TX checks depend on
+# a controller's cadence can depend on wall time (GM skips a steering message whose loopback came back too recently), so commands
+# stopped is a lost command stream, as the panda's rx checks see one: more than MAX_MISSED_MSGS of its periods without a frame
+# (opendbc safety.h tick_copy), the car's period its longest run of empty sendcan in its route and a cycle
+LOST_PERIODS = 10
 # the panda's real-time TX checks (rt_torque_rate_limit_check and the like) count frames in this window of its timer
 RT_INTERVAL = 0.25
+# libsafety's state the TX checks depend on
 SAFETY_STATE = ('controls_allowed', 'gas_pressed_prev', 'brake_pressed_prev', 'regen_braking_prev', 'steering_disengage_prev',
                 'cruise_engaged_prev', 'vehicle_moving', 'acc_main_on', 'relay_malfunction')
 
@@ -569,10 +570,10 @@ def _idle_context(rec: Recording, last_command: int, i: int) -> list[str]:
 
 def _commands_stopped(rec: Recording, max_idle: int) -> Check:
   # card publishes sendcan every cycle, empty on the cycles the car's controller sends nothing,
-  # so commands stopped is a run of more empty sendcan than the car's longest in its route and the jitter
+  # so commands stopped is a run of empty sendcan longer than LOST_PERIODS of the car's command period
   failures = []
   notes = []
-  allowed = max_idle + IDLE_JITTER
+  allowed = (max_idle + 1) * LOST_PERIODS - 1
   # the longest run of empty sendcan between two commands, as the route's max_idle is measured
   longest = None
   judged = False
@@ -611,14 +612,14 @@ def _commands_stopped(rec: Recording, max_idle: int) -> Check:
         notes += [f"t={t:.2f} {line}" for line in _idle_context(rec, last_command, i)]
         failed = True
   if failures:
-    return Check(f"commands idle more than the route max of {max_idle} cycles and {IDLE_JITTER} of jitter while engaged", failures, notes)
+    return Check(f"commands idle more than {allowed} cycles, {LOST_PERIODS} periods of the route's {max_idle + 1}, while engaged", failures, notes)
   if not judged:
     # after the engage edge failures it explains
     end = rec.t(len(rec.msgs) - 1) if rec.msgs else 0.
     return Check("no engaged span to check the commands of", [(end, "never engaged")])
   if longest is None:
     return Check(f"one command while engaged (route max idle {max_idle} cycles)", failures)
-  return Check(f"commands never idle more than {longest} cycles (route max {max_idle}, {IDLE_JITTER} of jitter)", failures)
+  return Check(f"commands never idle more than {longest} cycles (route max {max_idle}, stopped after {allowed})", failures)
 
 
 def _safety_pair(rec: Recording, mode: int, param: int) -> Check:
