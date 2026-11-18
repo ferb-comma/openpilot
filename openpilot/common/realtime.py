@@ -18,13 +18,11 @@ DT_DMON = 0.05  # driver monitoring
 
 
 class Priority:
-  # CORE 2
-  # - modeld = 55
-  # - camerad = 54
+  # CORE 6, shared with camerad (not realtime). not core 5: the ui runs there at CTRL_HIGH and,
+  # rendering on the CPU, can take most of each frame, starving these until radarState drops below 16 Hz
   CTRL_LOW = 51 # plannerd & radard
 
-  # CORE 3
-  # - pandad = 55
+  # CORE 4: card, controlsd, selfdrived. CORE 5: ui
   CTRL_HIGH = 53
 
 
