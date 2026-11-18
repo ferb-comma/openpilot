@@ -3,7 +3,7 @@ import unittest
 from opendbc.car import structs
 from opendbc.car.car_helpers import interfaces
 
-from openpilot.selfdrive.test.cars.fidelity import LOOPS, SLACK, Engage, Fidelity, diverging, engage_problems, selfdrive
+from openpilot.selfdrive.test.cars.fidelity import LOOPS, SLACK, Engage, Fidelity, diverging, engage_problems, extra_blocks, selfdrive
 
 ButtonType = structs.CarState.ButtonEvent.Type
 GearShifter = structs.CarState.GearShifter
@@ -112,6 +112,28 @@ class TestFidelityProblems(unittest.TestCase):
   def test_window_problem_first(self):
     f = Fidelity(["openpilot doesn't engage at the panda's edge: resumeBlocked at 4.99 s"], ["x"], {'gasPressed': ''}, None)
     assert f.problems == ["the route's window: openpilot doesn't engage at the panda's edge: resumeBlocked at 4.99 s"]
+
+
+class TestTxFidelity(unittest.TestCase):
+  def test_extra_blocks(self):
+    route = [(500, 0, 0x303)]
+    assert extra_blocks(route, [(500 + SLACK, 0, 0x303)]) == []
+    assert extra_blocks(route, [(500 + SLACK + 1, 0, 0x303)]) == [(500 + SLACK + 1, 0, 0x303)]
+    assert extra_blocks(route, [(500, 0, 0x14d)]) == [(500, 0, 0x14d)]
+
+  def test_route_blocks_alone_play(self):
+    f = Fidelity([], [], {}, 0, route_tx=[(500, 0, 0x14d)], replay_tx=[(501, 0, 0x14d)])
+    assert f.problems == []
+    assert "on the route's window too: 0x14d bus 0 at 5.00 s" in f.summary()
+
+  def test_replay_only_block(self):
+    f = Fidelity([], [], {}, 0, route_tx=[], replay_tx=[(780, 0, 0x14d)])
+    assert f.problems == ["the replay: libsafety blocks the DUT's commands from the route's carControl the route's window doesn't: 0x14d bus 0 at 7.80 s"]
+
+  def test_no_carcontrol(self):
+    f = Fidelity([], [], {}, 0)
+    assert f.problems == []
+    assert "not checked" in f.summary()
 
 
 if __name__ == "__main__":

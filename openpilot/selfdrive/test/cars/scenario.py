@@ -70,7 +70,7 @@ class Scenario:
   fidelity: str = ""
 
 
-def _first_can(msgs: list) -> int | None:
+def first_can(msgs: list) -> int | None:
   for m in msgs:
     if m.which() == 'can':
       return m.logMonoTime
@@ -80,7 +80,7 @@ def _first_can(msgs: list) -> int | None:
 def engaged_samples(msgs: Iterable) -> list[tuple[float, bool]]:
   samples = []
   msgs = list(msgs)
-  first = _first_can(msgs)
+  first = first_can(msgs)
   if first is None:
     return []
   for m in msgs:
@@ -97,7 +97,7 @@ def engaged_samples(msgs: Iterable) -> list[tuple[float, bool]]:
 
 def sendcan_samples(msgs: list) -> list[tuple[float, bool]]:
   # each logged sendcan and whether it carries a command, in the time base of engaged_samples
-  first = _first_can(msgs)
+  first = first_can(msgs)
   if first is None:
     return []
   return [((m.logMonoTime - first) / 1e9, len(m.sendcan) > 0) for m in msgs if m.which() == 'sendcan']

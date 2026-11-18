@@ -17,7 +17,7 @@ from openpilot.selfdrive.selfdrived.state import StateMachine
 from openpilot.selfdrive.test.cars.replay import (DT, Frame, build_replay, fingerprint_problems, needed_frames, over_budget, packets,
                                                   radar_problems, window_frames)
 from openpilot.selfdrive.test.cars.rules import ENGAGE_LIMIT
-from openpilot.selfdrive.test.cars.scenario import MIN_ENGAGED, TAIL, RouteCar, Scenario, build_candidates
+from openpilot.selfdrive.test.cars.scenario import MIN_ENGAGED, TAIL, RouteCar, Scenario, Window, build_candidates, first_can
 
 EventName = log.OnroadEvent.EventName
 ButtonType = structs.CarState.ButtonEvent.Type
@@ -160,6 +160,79 @@ def panda_allowed(mode: int, param: int, frames: list[Frame], enabled: list[bool
   return allowed
 
 
+def logged_controls(msgs: list, window: Window) -> list | None:
+  # the route's carControl each frame of the window, the latest logged at or before it, None without any
+  first = first_can(msgs)
+  n = round((window.end - window.start) / DT)
+  controls: list = [None] * n
+  for m in msgs:
+    if m.which() != 'carControl':
+      continue
+    i = int(((m.logMonoTime - first) / 1e9 - window.start) // DT)
+    if i < 0:
+      controls[0] = m.carControl
+    elif i < n:
+      controls[i] = m.carControl
+  if all(c is None for c in controls):
+    return None
+  for i in range(1, n):
+    if controls[i] is None:
+      controls[i] = controls[i - 1]
+  return controls
+
+
+# (frame of the second loop, bus, addr) of a command libsafety blocks
+Block = tuple[int, int, int]
+
+
+def tx_blocks(CP: structs.CarParams, mode: int, param: int, frames: list[Frame], controls: list) -> list[Block]:
+  # the commands the DUT's car controller makes from the route's carControl that libsafety blocks in the second of LOOPS loops,
+  # while openpilot is engaged and stays engaged the next frame as the rules judge them. the panda takes each frame's rx,
+  # then card updates carState from it and sends what it makes of the frame's carControl
+  safety = libsafety_py.libsafety
+  if safety.set_safety_hooks(mode, param) != 0:
+    raise ValueError(f"libsafety has no safety mode {mode} param {param}")
+  safety.set_alternative_experience(0)
+  car = interfaces[CP.carFingerprint](CP)
+  n = len(frames)
+  blocks = []
+  with _quiet_carlog():
+    for i, (loop, t, packet) in enumerate(_looped(frames)):
+      j = i % n
+      safety.set_timer(round(i * DT * 1e6))
+      for addr, dat, bus in frames[j]:
+        safety.safety_rx_hook(libsafety_py.make_CANPacket(addr, bus, dat))
+      CC = controls[j]
+      enabled = CC is not None and CC.enabled
+      if i % TICK == 0:
+        safety.safety_heartbeat(enabled)
+        safety.safety_tick()
+        safety.safety_heartbeat_check()
+      car.update([(t, packet)])
+      if CC is None:
+        continue
+      _, sends = car.apply(CC, t)
+      judged = loop == LOOPS - 1 and enabled and j + 1 < n and controls[j + 1].enabled
+      for addr, dat, bus in sends:
+        allowed = safety.safety_tx_hook(libsafety_py.make_CANPacket(addr, bus, dat))
+        if judged and not allowed:
+          blocks.append((j, bus, addr))
+  return blocks
+
+
+def extra_blocks(route: list[Block], replay: list[Block]) -> list[Block]:
+  # the replay's blocks with none of the same message within SLACK frames on the route's window
+  return [b for b in replay if not any(r[1:] == b[1:] and abs(r[0] - b[0]) <= SLACK for r in route)]
+
+
+def _blocks(blocks: list[Block]) -> str:
+  per: dict[tuple[int, int], list[int]] = {}
+  for j, bus, addr in blocks:
+    per.setdefault((bus, addr), []).append(j)
+  return "; ".join(f"{addr:#x} bus {bus} at {_times(frames[:4])}" + (f" (+{len(frames) - 4})" if len(frames) > 4 else "")
+                   for (bus, addr), frames in sorted(per.items()))
+
+
 @dataclass
 class Engage:
   # the second loop, in frames from its start: the panda's engage edges and the frame openpilot is enabled at each, None if it isn't
@@ -280,22 +353,46 @@ class Fidelity:
   delay: int | None
   # the DUT controller's longest run of cycles without a command while engaged on the replay
   idle: int | None = None
+  # the commands libsafety blocks while engaged, the DUT's car controller driven by the route's carControl on the route's
+  # window and on the replay, None without a logged carControl
+  route_tx: list[Block] | None = None
+  replay_tx: list[Block] | None = None
 
   @property
   def problems(self) -> list[str]:
     # changed fields only count when they change how the replay engages, which the replay's own problems tell
     if self.window:
       return [f"the route's window: {p}" for p in self.window]
-    if not self.replay:
+    replay = list(self.replay)
+    if self.route_tx is not None and self.replay_tx is not None:
+      extra = extra_blocks(self.route_tx, self.replay_tx)
+      if extra:
+        replay.append(f"libsafety blocks the DUT's commands from the route's carControl the route's window doesn't: {_blocks(extra)}")
+    if not replay:
       return []
-    return [f"the replay: {p}" for p in self.replay] + [f"the replay changes {name}: {how}" for name, how in self.fields.items()]
+    return [f"the replay: {p}" for p in replay] + [f"the replay changes {name}: {how}" for name, how in self.fields.items()]
 
   def summary(self) -> str:
     delay = f", openpilot engages {self.delay * DT:.2f} s after the panda's edge" if self.delay is not None else ""
     if self.fields:
       changed = "; ".join(f"{name}: {how}" for name, how in self.fields.items())
-      return f"fidelity: the panda and openpilot engage as on the route{delay}, the replay changes {changed}"
-    return f"fidelity: carState and the panda's engage edge match the route{delay}"
+      line = f"fidelity: the panda and openpilot engage as on the route{delay}, the replay changes {changed}"
+    else:
+      line = f"fidelity: carState and the panda's engage edge match the route{delay}"
+    return f"{line}. {self.tx_summary()}"
+
+  def tx_summary(self) -> str:
+    if self.route_tx is None or self.replay_tx is None:
+      return "TX: route logged no carControl, not checked"
+    if not self.route_tx and not self.replay_tx:
+      return "TX: libsafety allows every command the DUT's controller makes from the route's carControl"
+    lines = []
+    if self.route_tx:
+      lines.append(f"TX: libsafety blocks the DUT's commands from the route's carControl on the route's window too: {_blocks(self.route_tx)}")
+    extra = extra_blocks(self.route_tx, self.replay_tx)
+    if extra:
+      lines.append(f"TX: only on the replay: {_blocks(extra)}")
+    return ". ".join(lines) if lines else "TX: the replay blocks as the route's window does"
 
 
 def _times(frames: list[int]) -> str:
@@ -303,8 +400,9 @@ def _times(frames: list[int]) -> str:
 
 
 def fidelity(CP: structs.CarParams, mode: int, param: int, window: list[Frame], replay: list[Frame], end: float,
-             route_states: list[structs.CarState] | None = None) -> Fidelity:
-  # the replay against the route's window it was thinned from, both looped as the station plays them, end s from the window's start
+             controls: list | None, route_states: list[structs.CarState] | None = None, route_tx: list[Block] | None = None) -> Fidelity:
+  # the replay against the route's window it was thinned from, both looped as the station plays them, end s from the window's start.
+  # controls: the route's carControl each frame of the window
   route_states = car_states(CP, window) if route_states is None else route_states
   replay_states = car_states(CP, replay)
   route = engage(CP, mode, param, window, end, route_states)
@@ -321,7 +419,11 @@ def fidelity(CP: structs.CarParams, mode: int, param: int, window: list[Frame], 
   if played.rises and played.enabled_at[0] is not None:
     delay = played.enabled_at[0] - played.rises[0]
   idle = controller_idle(CP, replay, played.looped_enabled)
-  return Fidelity(window_problems, played_problems, diverging(route_states, replay_states), delay, idle)
+  replay_tx = None
+  if controls is not None:
+    route_tx = tx_blocks(CP, mode, param, window, controls) if route_tx is None else route_tx
+    replay_tx = tx_blocks(CP, mode, param, replay, controls)
+  return Fidelity(window_problems, played_problems, diverging(route_states, replay_states), delay, idle, route_tx, replay_tx)
 
 
 def _keys(keys) -> str:
@@ -337,7 +439,7 @@ def replay_problems(s: Scenario, car: RouteCar, msgs: list, budget: dict[int, fl
   problems += radar_problems(car.dut_CP, window, replay)
   if problems:
     return problems, None
-  f = fidelity(car.dut_CP, s.mode, s.param, window, replay, s.window.end - TAIL - s.window.start)
+  f = fidelity(car.dut_CP, s.mode, s.param, window, replay, s.window.end - TAIL - s.window.start, logged_controls(msgs, s.window))
   return f.problems, f
 
 
@@ -348,6 +450,8 @@ def faithful_messages(s: Scenario, car: RouteCar, msgs: list, budget: dict[int, 
   window = window_frames(msgs, s.window)
   end = s.window.end - TAIL - s.window.start
   route_states = car_states(CP, window)
+  controls = logged_controls(msgs, s.window)
+  route_tx = tx_blocks(CP, s.mode, s.param, window, controls) if controls is not None else None
   needed = needed_frames(CP, s.rx_checks, window)
   replay = build_replay(s, car, msgs, budget).frames
   full = Counter((bus, addr) for frame in needed for addr, _, bus in frame)
@@ -358,7 +462,7 @@ def faithful_messages(s: Scenario, car: RouteCar, msgs: list, budget: dict[int, 
   def faithful(keys: set[tuple[int, int]]) -> bool:
     mixed = [[f for f in thin_frame if (f[2], f[0]) not in keys] + [f for f in full_frame if (f[2], f[0]) in keys]
              for thin_frame, full_frame in zip(replay, needed, strict=True)]
-    f = fidelity(CP, s.mode, s.param, window, mixed, end, route_states)
+    f = fidelity(CP, s.mode, s.param, window, mixed, end, controls, route_states, route_tx)
     return not f.problems and not f.fields
 
   if not faithful(set(thinned)):
@@ -395,14 +499,20 @@ def check_scenario(s: Scenario, car: RouteCar, msgs: list, budget: dict[int, flo
     return s, problems + ["keeping every frame of the messages thinning drops doesn't help"]
   # the fewest frames first, every k-th frame moves a change by at most k - 1 frames
   first_problems = None
+  # the first that plays, though thinning the rest harder changes a field
+  plays = None
   for k in range(SLACK + 1, 0, -1):
     kept = replace(s, kept=tuple((bus, addr, k) for bus, addr in keys))
     kept_problems, kept_f = replay_problems(kept, car, msgs, budget)
     if not kept_problems and kept_f is not None and not kept_f.fields:
       return _cadence(kept, kept_f), []
+    if not kept_problems and kept_f is not None and plays is None:
+      plays = (kept, kept_f)
     first_problems = kept_problems if first_problems is None else first_problems
   if not problems:
     return _cadence(s, f), []
+  if plays is not None:
+    return _cadence(*plays), []
   return s, problems + [f"keeping {_keys(keys)} every {SLACK + 1} frames: {', '.join(first_problems or ['carState still differs'])}"]
 
 
