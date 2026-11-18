@@ -99,13 +99,17 @@ class TestEngageProblems(unittest.TestCase):
     assert engage_problems(Engage([1200], [1200], [], False, False, None, [], [], []), 15.)[0].startswith("the panda's edge at 12.00 s leaves less than")
 
   def test_disallowed_before_edge(self):
-    # a pandaStates has to see the panda disallowed before its edge, a heartbeat drop may come a tick later on a station
-    def problems(disallowed: int, heartbeat_drop: bool) -> list[str]:
-      return engage_problems(Engage([500], [500], [], False, False, None, [], [], [], disallowed, heartbeat_drop), 15.)
+    # a pandaStates has to see the panda disallowed before its edge, a drop on the panda's tick may come a tick later on a station
+    def problems(disallowed: int, tick_drop: bool) -> list[str]:
+      return engage_problems(Engage([500], [500], [], False, False, None, [], [], [], disallowed, tick_drop), 15.)
     assert problems(PANDA_STATES + SLACK, False) == []
     assert problems(PANDA_STATES + SLACK - 1, False)[0].startswith("the panda's edge at 5.00 s comes 0.11 s after it drops controls")
-    assert problems(PANDA_STATES + SLACK + TICK - 1, True)[0].startswith("the panda's edge at 5.00 s comes 1.11 s after its heartbeat check")
+    assert problems(PANDA_STATES + SLACK + TICK - 1, True)[0].startswith("the panda's edge at 5.00 s comes 1.11 s after its tick")
     assert problems(PANDA_STATES + SLACK + TICK, True) == []
+
+  def test_drop_on_one_frame(self):
+    e = Engage([500], [500], [], False, False, None, [], [], [], 100, False, 400, (0, 0x1d2), False)
+    assert engage_problems(e, 15.) == ["the panda drops controls before its edge on one frame of 0x1d2 bus 0, not in time if the station loses it"]
 
 
 class TestFidelityProblems(unittest.TestCase):

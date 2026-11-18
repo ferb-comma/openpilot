@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from functools import partial
 
+from opendbc.can.dbc import DBC
 from opendbc.car import structs
 from opendbc.car.car_helpers import interfaces
 from opendbc.safety.tests.libsafety import libsafety_py
@@ -15,16 +16,17 @@ from openpilot.selfdrive.car.car_events import CarEvents
 from openpilot.selfdrive.car.cruise import V_CRUISE_INITIAL, VCruiseHelper
 from openpilot.selfdrive.selfdrived.events import EVENT_NAME, EVENTS, ET, Events
 from openpilot.selfdrive.selfdrived.state import StateMachine
-from openpilot.selfdrive.test.cars.replay import (DT, Frame, build_replay, fingerprint_problems, needed_frames, over_budget, packets,
+from openpilot.selfdrive.test.cars.replay import (DT, Frame, _dbcs, build_replay, fingerprint_problems, needed_frames, over_budget, packets,
                                                   radar_problems, window_frames)
-from openpilot.selfdrive.test.cars.rules import ENGAGE_LIMIT
+from openpilot.selfdrive.test.cars.rules import ENGAGE_LIMIT, signal_values
 from openpilot.selfdrive.test.cars.scenario import MIN_ENGAGED, TAIL, RouteCar, Scenario, Window, build_candidates, first_can
 
 EventName = log.OnroadEvent.EventName
 ButtonType = structs.CarState.ButtonEvent.Type
 
-# the UP loops the window, so the second loop starts from the state the first left the panda, the parsers and openpilot in
-LOOPS = 2
+# the UP loops the window, so a loop starts from the state the previous one left the panda, the parsers and openpilot in.
+# the first loop warms up the parsers and openpilot from nothing, the second engages as a station's previous loop did, the last is judged
+LOOPS = 3
 # the panda calls safety_tick and its heartbeat check at 1 Hz
 TICK = round(1. / DT)
 # frames a carState change may move by on the replay
@@ -74,7 +76,7 @@ def car_states(CP: structs.CarParams, frames: list[Frame]) -> list[structs.CarSt
 
 def controller_idle(CP: structs.CarParams, frames: list[Frame], enabled: list[bool]) -> int | None:
   # the longest run of cycles the DUT's car controller sends nothing between two commands while openpilot is engaged in the
-  # second loop, its command cadence on the replay. None without two commands
+  # last loop, its command cadence on the replay. None without two commands
   car = interfaces[CP.carFingerprint](CP)
   longest = None
   run = None
@@ -143,24 +145,32 @@ def selfdrive(CP: structs.CarParams, states: list[structs.CarState]) -> list[Ste
   return steps
 
 
-def panda_allowed(mode: int, param: int, frames: list[Frame], enabled: list[bool]) -> list[bool]:
-  # the panda's controls_allowed each frame of LOOPS loops, with openpilot's engaged state in its heartbeat
+def panda_allowed(mode: int, param: int, frames: list[Frame], enabled: list[bool],
+                  lost: tuple[int, int, int] | None = None) -> tuple[list[bool], dict[int, tuple[int, int]]]:
+  # the panda's controls_allowed each frame of LOOPS loops, with openpilot's engaged state in its heartbeat, and the frames
+  # a message's rx drops controls at -> its (bus, addr). lost: (frame, bus, addr) of a message's frame the station's lane loses
   safety = libsafety_py.libsafety
   if safety.set_safety_hooks(mode, param) != 0:
     raise ValueError(f"libsafety has no safety mode {mode} param {param}")
   # as card sets it
   safety.set_alternative_experience(0)
   allowed = []
+  drops = {}
   for i in range(LOOPS * len(frames)):
     safety.set_timer(round(i * DT * 1e6))
     for addr, dat, bus in frames[i % len(frames)]:
+      if (i, bus, addr) == lost:
+        continue
+      was = safety.get_controls_allowed()
       safety.safety_rx_hook(libsafety_py.make_CANPacket(addr, bus, dat))
+      if was and not safety.get_controls_allowed():
+        drops[i] = (bus, addr)
     if i % TICK == 0:
       safety.safety_heartbeat(enabled[i])
       safety.safety_tick()
       safety.safety_heartbeat_check()
     allowed.append(bool(safety.get_controls_allowed()))
-  return allowed
+  return allowed, drops
 
 
 def logged_controls(msgs: list, window: Window) -> list | None:
@@ -184,12 +194,12 @@ def logged_controls(msgs: list, window: Window) -> list | None:
   return controls
 
 
-# (frame of the second loop, bus, addr) of a command libsafety blocks
+# (frame of the last loop, bus, addr) of a command libsafety blocks
 Block = tuple[int, int, int]
 
 
 def tx_blocks(CP: structs.CarParams, mode: int, param: int, frames: list[Frame], controls: list) -> list[Block]:
-  # the commands the DUT's car controller makes from the route's carControl that libsafety blocks in the second of LOOPS loops,
+  # the commands the DUT's car controller makes from the route's carControl that libsafety blocks in the last of LOOPS loops,
   # while openpilot is engaged and stays engaged the next frame as the rules judge them. the panda takes each frame's rx,
   # then card updates carState from it and sends what it makes of the frame's carControl
   safety = libsafety_py.libsafety
@@ -238,7 +248,7 @@ def _blocks(blocks: list[Block]) -> str:
 
 @dataclass
 class Engage:
-  # the second loop, in frames from its start: the panda's engage edges and the frame openpilot is enabled at each, None if it isn't
+  # the last loop, in frames from its start: the panda's engage edges and the frame openpilot is enabled at each, None if it isn't
   rises: list[int]
   enabled_at: list[int | None]
   # why openpilot doesn't enable at an edge
@@ -248,61 +258,83 @@ class Engage:
   carried: bool
   # the first frame the panda doesn't allow controls with openpilot engaged longer than the engage limit
   dropped: int | None
-  # the panda's controls_allowed and openpilot's enabled each frame of the second loop up to its end
+  # the panda's controls_allowed and openpilot's enabled each frame of the last loop up to its end
   allowed: list[bool]
   enabled: list[bool]
   # openpilot's enabled each frame of every loop
   looped_enabled: list[bool]
-  # frames the panda is disallowed before its first edge, and whether its heartbeat check dropped it, which a station's
-  # panda does up to a tick later as its ticks aren't in phase with the loop
+  # frames the panda is disallowed before its first edge, and whether its 1 Hz tick or heartbeat check dropped it, which a
+  # station's panda does up to a tick later as its ticks aren't in phase with the loop
   disallowed: int | None = None
-  heartbeat_drop: bool = False
+  tick_drop: bool = False
+  # the frame of every loop the panda drops controls at before its first edge, and the (bus, addr) whose rx drops them
+  drop: int | None = None
+  dropper: tuple[int, int] | None = None
+  # the panda still drops controls in time if the station's lane loses the frame that drops them
+  robust: bool = True
+
+
+def _need(tick_drop: bool) -> int:
+  # frames the panda has to be disallowed before its edge for a pandaStates to see it
+  return PANDA_STATES + SLACK + (TICK if tick_drop else 0)
+
+
+def _drop_before(allowed: list[bool], drops: dict[int, tuple[int, int]], rise: int) -> tuple[int, int, tuple[int, int] | None, bool]:
+  # the frame the panda drops controls at before the edge, its frames disallowed, the message that drops them and whether its tick does
+  drop = next((i + 1 for i in range(rise - 1, -1, -1) if allowed[i]), 0)
+  dropper = drops.get(drop)
+  return drop, rise - drop, dropper, dropper is None and drop > 0
 
 
 def engage(CP: structs.CarParams, mode: int, param: int, frames: list[Frame], end: float,
            states: list[structs.CarState] | None = None) -> Engage:
-  # the second loop as the station plays it up to end s: the panda's engage edges and openpilot's enable at each
+  # the last loop as the station plays it up to end s: the panda's engage edges and openpilot's enable at each
   n = len(frames)
+  start = (LOOPS - 1) * n
   states = car_states(CP, frames) if states is None else states
   steps = selfdrive(CP, states)
-  allowed = panda_allowed(mode, param, frames, [s.enabled for s in steps])
-  last = n + min(round(end / DT), n - 1)
+  allowed, drops = panda_allowed(mode, param, frames, [s.enabled for s in steps])
+  last = start + min(round(end / DT), n - 1)
   limit = round(ENGAGE_LIMIT / DT)
-  rises = [i for i in range(n, last + 1) if allowed[i] and not allowed[i - 1]]
+  rises = [i for i in range(start, last + 1) if allowed[i] and not allowed[i - 1]]
   enabled_at = []
   blocked = []
   for rise in rises:
     # the rules count openpilot enabled at the edge, it may enable on the same message a little before the panda
     at = next((i for i in range(rise, min(rise + limit, last) + 1) if steps[i].enabled), None)
-    enabled_at.append(None if at is None else at - n)
+    enabled_at.append(None if at is None else at - start)
     if at is None:
       window = steps[rise:rise + limit + 1]
       names = sorted({name for s in window if s.enable for name in s.no_entry})
       if not names and not any(s.enable for s in window):
         names = ["no enable event"]
-      blocked.append(f"{', '.join(names)} at {(rise - n) * DT:.2f} s")
+      blocked.append(f"{', '.join(names)} at {(rise - start) * DT:.2f} s")
   first = rises[0] if rises else last
-  carried = all(s.enabled for s in steps[n:first + 1])
+  carried = all(s.enabled for s in steps[start:first + 1])
   dropped = None
   since = None
   for i in range(first, last + 1):
     since = None if not steps[i].enabled else (i if since is None else since)
     if since is not None and not allowed[i] and i - since > limit:
-      dropped = i - n
+      dropped = i - start
       break
-  disallowed = None
-  heartbeat_drop = False
+  drop = disallowed = dropper = None
+  tick_drop = False
+  robust = True
   if rises:
-    drop = next((i + 1 for i in range(rises[0] - 1, -1, -1) if allowed[i]), 0)
-    disallowed = rises[0] - drop
-    heartbeat_drop = drop % TICK == 0 and not steps[drop].enabled
+    drop, disallowed, dropper, tick_drop = _drop_before(allowed, drops, rises[0])
+    if dropper is not None:
+      # the station's lane may lose a frame, the next frames of the message have to drop controls in time too
+      lost, lost_drops = panda_allowed(mode, param, frames, [s.enabled for s in steps], (drop, *dropper))
+      _, lost_disallowed, _, lost_tick = _drop_before(lost, lost_drops, rises[0])
+      robust = lost[rises[0]] and lost_disallowed >= _need(lost_tick)
   looped_enabled = [s.enabled for s in steps]
-  return Engage([r - n for r in rises], enabled_at, blocked, allowed[n], carried, dropped, allowed[n:last + 1],
-                looped_enabled[n:last + 1], looped_enabled, disallowed, heartbeat_drop)
+  return Engage([r - start for r in rises], enabled_at, blocked, allowed[start], carried, dropped, allowed[start:last + 1],
+                looped_enabled[start:last + 1], looped_enabled, disallowed, tick_drop, drop, dropper, robust)
 
 
 def engage_problems(e: Engage, end: float) -> list[str]:
-  # what keeps the second loop from a panda engage edge that openpilot engages on and stays engaged with
+  # what keeps the last loop from a panda engage edge that openpilot engages on and stays engaged with
   if not e.rises:
     if e.allowed_at_start:
       return ["the panda stays allowed across the loop's wrap, nothing before the edge drops it"]
@@ -310,10 +342,13 @@ def engage_problems(e: Engage, end: float) -> list[str]:
   problems = []
   if end - e.rises[0] * DT < MIN_ENGAGED:
     problems.append(f"the panda's edge at {e.rises[0] * DT:.2f} s leaves less than {MIN_ENGAGED:g} s engaged")
-  need = PANDA_STATES + SLACK + (TICK if e.heartbeat_drop else 0)
+  need = _need(e.tick_drop)
   if e.disallowed is not None and e.disallowed < need:
-    how = "its heartbeat check drops controls" if e.heartbeat_drop else "it drops controls"
+    how = "its tick drops controls" if e.tick_drop else "it drops controls"
     problems.append(f"the panda's edge at {e.rises[0] * DT:.2f} s comes {e.disallowed * DT:.2f} s after {how}, less than {need * DT:.2f} s")
+  elif not e.robust and e.dropper is not None:
+    bus, addr = e.dropper
+    problems.append(f"the panda drops controls before its edge on one frame of {addr:#x} bus {bus}, not in time if the station loses it")
   if e.carried:
     problems.append("openpilot stays engaged across the loop's wrap")
   elif e.blocked:
@@ -342,9 +377,9 @@ def _describe(changes: list[tuple]) -> str:
 
 
 def diverging(route: list[structs.CarState], replay: list[structs.CarState]) -> dict[str, str]:
-  # field -> how the replay's second loop differs from the route window's, for the fields that engage or block openpilot
+  # field -> how the replay's last loop differs from the route window's, for the fields that engage or block openpilot
   n = len(route) // LOOPS
-  route, replay = route[n:], replay[n:]
+  route, replay = route[-n:], replay[-n:]
   out = {}
   for name in FIELDS:
     a = _changes([_field(CS, name) for CS in route])
@@ -374,6 +409,8 @@ class Fidelity:
   # window and on the replay, None without a logged carControl
   route_tx: list[Block] | None = None
   replay_tx: list[Block] | None = None
+  # what drops the panda's controls before its edge on the replay
+  drop: str = ""
 
   @property
   def problems(self) -> list[str]:
@@ -396,7 +433,8 @@ class Fidelity:
       line = f"fidelity: the panda and openpilot engage as on the route{delay}, the replay changes {changed}"
     else:
       line = f"fidelity: carState and the panda's engage edge match the route{delay}"
-    return f"{line}. {self.tx_summary()}"
+    drop = f", {self.drop}" if self.drop else ""
+    return f"{line}{drop}. {self.tx_summary()}"
 
   def tx_summary(self) -> str:
     if self.route_tx is None or self.replay_tx is None:
@@ -410,6 +448,26 @@ class Fidelity:
     if extra:
       lines.append(f"TX: only on the replay: {_blocks(extra)}")
     return ". ".join(lines) if lines else "TX: the replay blocks as the route's window does"
+
+
+def drop_cause(CP: structs.CarParams, frames: list[Frame], e: Engage) -> str:
+  # what drops the panda's controls before its edge: the message and its signals that change at the frame that drops them
+  if e.drop is None or e.disallowed is None:
+    return ""
+  when = f"the panda drops controls {e.disallowed * DT:.2f} s before its edge"
+  if e.dropper is None:
+    return f"{when} on its tick" if e.tick_drop else ""
+  bus, addr = e.dropper
+  n = len(frames)
+  seen = [dat for i in range(e.drop + 1) for a, dat, b in frames[i % n] if (b, a) == e.dropper]
+  dbc = _dbcs(CP).get(e.dropper)
+  if dbc is None or len(seen) < 2:
+    return f"{when} on {addr:#x} bus {bus}"
+  msg = DBC(dbc).addr_to_msg[addr]
+  before = signal_values(msg, seen[-2])
+  now = signal_values(msg, seen[-1])
+  changed = ", ".join(f"{name} {before[name]:g} → {value:g}" for name, value in now.items() if value != before[name])
+  return f"{when} on {msg.name} {addr:#x} bus {bus} ({changed or 'no signal changes'})"
 
 
 def _times(frames: list[int]) -> str:
@@ -440,7 +498,8 @@ def fidelity(CP: structs.CarParams, mode: int, param: int, window: list[Frame], 
   if controls is not None:
     route_tx = tx_blocks(CP, mode, param, window, controls) if route_tx is None else route_tx
     replay_tx = tx_blocks(CP, mode, param, replay, controls)
-  return Fidelity(window_problems, played_problems, diverging(route_states, replay_states), delay, idle, route_tx, replay_tx)
+  return Fidelity(window_problems, played_problems, diverging(route_states, replay_states), delay, idle, route_tx, replay_tx,
+                  drop_cause(CP, replay, played))
 
 
 def _keys(keys) -> str:
