@@ -315,16 +315,31 @@ def _safety_state(safety) -> dict[str, bool]:
   return {name: bool(getattr(safety, f"get_{name}")()) for name in SAFETY_STATE}
 
 
+def _sent(pending: list[tuple[bytes, int]], dat: bytes) -> int | None:
+  # how many of the sent frames not yet echoed the panda took up to the one with this data, the oldest, None if none has it
+  for n, (sent, _) in enumerate(pending):
+    # a CAN FD frame comes back padded to its length code
+    if dat[:len(sent)] == sent:
+      return n + 1
+  return None
+
+
+def _tx_hook(safety, addr: int, bus: int, dat: bytes, t: float) -> bool:
+  safety.set_timer(round(t * 1e6) & 0xFFFFFFFF)
+  return bool(safety.safety_tx_hook(libsafety_py.make_CANPacket(addr, bus, dat)))
+
+
 def safety_decisions(rec: Recording, mode: int, param: int, safety) -> dict[tuple[int, int], Decision]:
-  # (message index, frame index) of each frame openpilot sent that the panda sent (src + 128) or blocked (src + 192) -> libsafety's decision,
-  # fed the recording's rx (src 0-2) and openpilot's engaged state in the heartbeat in the order pandad read them
+  # (message index, frame index) of each frame openpilot sent that the panda sent (src + 128) or blocked (src + 192) -> libsafety's decision.
+  # the panda queues its echo or block of a frame with the rx (src 0-2) as its tx hook takes it, so libsafety takes the frame there,
+  # at the time card's sendcan passed it on and with openpilot's engaged state in the heartbeat. the panda also echoes the frames it
+  # forwards, those match no sent frame
   if safety.set_safety_hooks(mode, param) != 0:
     return {}
-  # the panda also echoes the frames it forwards, only what openpilot sent went through its tx hook
-  sent = {(c.address, c.src) for m in rec.msgs if m.which() == 'sendcan' for c in m.sendcan}
   first = rec.msgs[0].logMonoTime if rec.msgs else 0
+  # (addr, bus) -> the data and sendcan time of each sent frame not yet echoed
+  pending: dict[tuple[int, int], list[tuple[bytes, int]]] = {}
   decisions = {}
-  enabled = False
   tick = None
   state = _safety_state(safety)
   changed = 0.
@@ -332,24 +347,37 @@ def safety_decisions(rec: Recording, mode: int, param: int, safety) -> dict[tupl
     which = msg.which()
     t = (msg.logMonoTime - first) / 1e9
     if which == 'selfdriveState':
-      enabled = msg.selfdriveState.enabled
+      # pandad passes it on in its heartbeat
+      safety.safety_heartbeat(msg.selfdriveState.enabled)
     elif which == 'pandaStates' and len(msg.pandaStates):
       safety.set_alternative_experience(msg.pandaStates[0].alternativeExperience)
+    elif which == 'sendcan':
+      for frame in msg.sendcan:
+        pending.setdefault((frame.address, frame.src), []).append((bytes(frame.dat), msg.logMonoTime))
     if which != 'can':
       continue
     safety.set_timer(round(t * 1e6) & 0xFFFFFFFF)
     # the panda calls safety_tick and checks the heartbeat at 1 Hz
     if tick is None or t - tick >= 1.:
       tick = t
-      safety.safety_heartbeat(enabled)
       safety.safety_tick()
       safety.safety_heartbeat_check()
     for k, frame in enumerate(msg.can):
       if frame.src < BUSES:
         safety.safety_rx_hook(libsafety_py.make_CANPacket(frame.address, frame.src, frame.dat))
-      elif frame.src - BLOCKED in range(BUSES) or (frame.address, frame.src - ECHO_BASE) in sent:
+      elif frame.src - ECHO_BASE in range(BUSES) or frame.src - BLOCKED in range(BUSES):
         bus = frame.src - (ECHO_BASE if frame.src < BLOCKED else BLOCKED)
-        allowed = bool(safety.safety_tx_hook(libsafety_py.make_CANPacket(frame.address, bus, frame.dat)))
+        sent = pending.get((frame.address, bus), [])
+        taken = _sent(sent, bytes(frame.dat))
+        if taken is None:
+          continue
+        # the panda echoes a bus's frames in order, it took the ones before this one but their echo is lost
+        for dat, sent_at in sent[:taken - 1]:
+          _tx_hook(safety, frame.address, bus, dat, (sent_at - first) / 1e9)
+        dat, sent_at = sent[taken - 1]
+        allowed = _tx_hook(safety, frame.address, bus, dat, (sent_at - first) / 1e9)
+        del sent[:taken]
+        safety.set_timer(round(t * 1e6) & 0xFFFFFFFF)
         decisions[(i, k)] = Decision(allowed, state, t - changed)
       now = _safety_state(safety)
       if now != state:

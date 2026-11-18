@@ -39,14 +39,19 @@ def error_log(t, record):
   return msg
 
 
-def can_msg(which, t, frames):
+def can_msg(which, t, frames, dat=bytes(8)):
   msg = new_message(which, len(frames))
   msg.logMonoTime = int(t * 1e9)
   for c, (addr, src) in zip(getattr(msg, which), frames, strict=True):
     c.address = addr
-    c.dat = bytes(8)
+    c.dat = dat
     c.src = src
   return msg
+
+
+def blocked_command(t):
+  # card's command and the panda's block of it in the next can message
+  return [can_msg('sendcan', t - 0.005, [(0x100, 0)]), can_msg('can', t, [(0x100, 192)])]
 
 
 def clean_drive(duration=5.):
@@ -144,7 +149,7 @@ class TestRules(unittest.TestCase):
     # the gas press reaches the panda in the cycle before the block, openpilot's command is from before it
     msgs = clean_drive()
     msgs.append(can_msg('can', 3.05, [(GAS, 0)]))
-    msgs.append(can_msg('can', 3.05 + (TRANSITION - 1) * 0.01, [(0x100, 192)]))
+    msgs += blocked_command(3.05 + (TRANSITION - 1) * 0.01)
     assert oracle_failures(msgs, FakeSafety()) == []
     blocked = rule_checks(msgs, TOYOTA, 0, 0, safety=FakeSafety())[1]
     assert "1 of them at a transition libsafety blocks too" in blocked.evidence
@@ -152,13 +157,13 @@ class TestRules(unittest.TestCase):
   def test_block_long_after_transition(self):
     msgs = clean_drive()
     msgs.append(can_msg('can', 3.05, [(GAS, 0)]))
-    msgs.append(can_msg('can', 3.05 + (TRANSITION + 1) * 0.01, [(0x100, 192)]))
+    msgs += blocked_command(3.05 + (TRANSITION + 1) * 0.01)
     result = oracle_failures(msgs, FakeSafety())
     assert result == ["t=3.09 blocked while engaged, addr 0x100 bus 0, libsafety blocks it too, not at a transition"]
 
   def test_block_libsafety_allows(self):
     msgs = clean_drive()
-    msgs.append(can_msg('can', 3.05, [(0x100, 192)]))
+    msgs += blocked_command(3.05)
     result = oracle_failures(msgs, FakeSafety())
     assert result == ["t=3.05 blocked while engaged, addr 0x100 bus 0, libsafety allows it"]
     notes = rule_checks(msgs, TOYOTA, 0, 0, safety=FakeSafety())[1].notes
@@ -169,6 +174,23 @@ class TestRules(unittest.TestCase):
     blocked = rule_checks(msgs, TOYOTA, 0, 0, safety=FakeSafety(blocks_all=True))[1]
     assert blocked.failures == []
     assert blocked.evidence.endswith("5 sent that libsafety blocks")
+
+  def test_tx_in_echo_order(self):
+    # the panda queues its echo of a command with the rx as it takes it, after the drive's commands
+    for frames, blocked in (([(0x100, 128), (GAS, 0)], 0), ([(GAS, 0), (0x100, 128)], 1)):
+      msgs = clean_drive()
+      msgs.append(can_msg('sendcan', 6.5, [(0x100, 0)]))
+      msgs.append(can_msg('can', 6.505, frames))
+      check = rule_checks(msgs, TOYOTA, 0, 0, safety=FakeSafety())[1]
+      assert check.evidence.endswith(f"{blocked} sent that libsafety blocks")
+
+  def test_forwarded_echo(self):
+    # the panda's echo of a frame it forwards isn't a command, though openpilot sends the same message
+    msgs = clean_drive()
+    msgs.append(can_msg('can', 6.5, [(GAS, 0)]))
+    msgs.append(can_msg('can', 6.51, [(0x100, 128)], dat=bytes([1] * 8)))
+    blocked = rule_checks(msgs, TOYOTA, 0, 0, safety=FakeSafety())[1]
+    assert blocked.evidence.endswith("0 sent that libsafety blocks")
 
   def test_brake_disengage(self):
     # the panda drops controls and blocks commands, openpilot disengages right after
