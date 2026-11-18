@@ -196,7 +196,9 @@ def _commands_stopped(rec: Recording) -> list[tuple[float, str]]:
     for pos in range(first + 1, last + 1):
       lo = rec.sd_idx[pos - 1]
       hi = rec.sd_idx[pos]
-      if bisect.bisect_left(sendcan_idx, hi) - bisect.bisect_right(sendcan_idx, lo) == 0:
+      # at a disengage card stops one step before selfdriveState reports it
+      stopped = bisect.bisect_left(sendcan_idx, hi) - bisect.bisect_right(sendcan_idx, lo) == 0
+      if stopped and rec.stays_enabled(hi):
         t = rec.t(hi)
         failures.append((t, f"t={t:.2f} commands stopped while engaged"))
         break

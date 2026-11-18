@@ -113,6 +113,19 @@ class TestRules(unittest.TestCase):
     assert len(result) == 1
     assert "commands stopped" in result[0]
 
+  def test_commands_stop_before_disengage(self):
+    msgs = clean_drive(3.)
+    msgs += [selfdrive_state(5.02, True), selfdrive_state(6.02, False)]
+    assert failures(msgs) == []
+
+  def test_commands_stop_stays_engaged(self):
+    msgs = clean_drive(3.)
+    msgs += [selfdrive_state(5.02 + i, True) for i in range(3)]
+    msgs.append(selfdrive_state(8.02, False))
+    result = failures(msgs)
+    assert len(result) == 1
+    assert result[0].startswith("t=5.02 commands stopped")
+
 
 if __name__ == "__main__":
   unittest.main()
