@@ -113,16 +113,49 @@ def _values(msg: Msg, dat: bytes) -> dict[str, float]:
   return values
 
 
+def _radar_trigger(CP: structs.CarParams) -> tuple[int, int] | None:
+  # (bus, addr) of the message the radar interface publishes its tracks on, radard needs it at the car's rate
+  _, radar = _parsers(CP)
+  trigger = getattr(radar, 'trigger_msg', None)
+  if radar.rcp is None or trigger is None:
+    return None
+  return radar.rcp.bus, trigger
+
+
+def _full_rate(dbcs: dict[tuple[int, int], str], parsed: dict[str, DBC], rx_checks: dict[tuple[int, int], bool],
+               radar_trigger: tuple[int, int] | None, key: tuple[int, int]) -> bool:
+  # the messages that keep every frame
+  if key == radar_trigger:
+    return True
+  if key not in rx_checks:
+    return False
+  # the panda checks this message and no DBC can repack it or its counter
+  dbc = dbcs.get(key)
+  if dbc is None:
+    return True
+  msg = parsed[dbc].addr_to_msg[key[1]]
+  return rx_checks[key] and not any(_is_counter(sig) for sig in msg.sigs.values())
+
+
 def thin(CP: structs.CarParams, rx_checks: dict[tuple[int, int], bool], frames: list[Frame], budget: dict[int, float]) -> list[Frame]:
   seconds = len(frames) * DT
-  load = Counter(bus for f in frames for _, _, bus in f)
-  # every k-th frame of each message on a bus
-  keep = {}
-  for bus, rate in budget.items():
-    if load[bus]:
-      keep[bus] = max(1, math.ceil(load[bus] / seconds / rate))
   dbcs = _dbcs(CP)
   parsed = {name: DBC(name) for name in set(dbcs.values())}
+  radar_trigger = _radar_trigger(CP)
+  counts = Counter((bus, addr) for f in frames for addr, _, bus in f)
+  full = {key for key in counts if _full_rate(dbcs, parsed, rx_checks, radar_trigger, key)}
+  # every k-th frame of each other message on a bus, in what the full rate messages leave of the budget
+  keep = {}
+  for bus, rate in budget.items():
+    fixed = sum(n for key, n in counts.items() if key[0] == bus and key in full)
+    rest = [n for key, n in counts.items() if key[0] == bus and key not in full]
+    if not rest:
+      continue
+    # each message keeps its first frame and every k-th after it
+    k = 1
+    while k < len(frames) and fixed + sum(math.ceil(n / k) for n in rest) > rate * seconds:
+      k += 1
+    keep[bus] = k
   # one packer per bus and DBC, so each bus continues its own counters
   packers: dict[tuple[int, str], CANPacker] = {}
   seen: Counter[tuple[int, int]] = Counter()
@@ -132,15 +165,9 @@ def thin(CP: structs.CarParams, rx_checks: dict[tuple[int, int], bool], frames: 
     for addr, dat, bus in frame:
       n = seen[(bus, addr)]
       seen[(bus, addr)] += 1
-      k = keep.get(bus, 1)
+      k = 1 if (bus, addr) in full else keep.get(bus, 1)
       dbc = dbcs.get((bus, addr))
       msg = parsed[dbc].addr_to_msg[addr] if dbc is not None else None
-      # the panda checks this message and no DBC can repack it or its counter, so it keeps every frame
-      if (bus, addr) in rx_checks:
-        if msg is None:
-          k = 1
-        elif rx_checks[(bus, addr)] and not any(_is_counter(sig) for sig in msg.sigs.values()):
-          k = 1
       if n % k:
         continue
       # a kept frame skips k - 1 counter steps, repack it so the counter and checksum stay consecutive
@@ -162,6 +189,39 @@ def over_budget(frames: list[Frame], budget: dict[int, float]) -> list[str]:
   return over
 
 
+def _radar_output(CP: structs.CarParams, frames: list[Frame]) -> tuple[int, set[str]]:
+  # tracks published and the errors raised by the radar interface on the second of two loops, as the UP plays it
+  _, radar = _parsers(CP)
+  packets = _packets(frames)
+  loop = round(len(frames) * DT * 1e9)
+  for t, packet in packets:
+    radar.update([(t, packet)])
+  published = 0
+  errors: set[str] = set()
+  for t, packet in packets:
+    out = radar.update([(t + loop, packet)])
+    if out is None:
+      continue
+    published += 1
+    errors |= {name for name, raised in out.errors.to_dict().items() if raised}
+  return published, errors
+
+
+def radar_problems(CP: structs.CarParams, window: list[Frame], replay: list[Frame]) -> list[str]:
+  # the radar interface has to publish as often and with no more errors on the replay as on the route's window
+  if _radar_trigger(CP) is None:
+    return []
+  route_published, route_errors = _radar_output(CP, window)
+  published, errors = _radar_output(CP, replay)
+  seconds = len(window) * DT
+  problems = []
+  if published < route_published:
+    problems.append(f"radar tracks {published / seconds:.1f} Hz < {route_published / seconds:.1f} Hz on the route")
+  if errors - route_errors:
+    problems.append(f"radar errors {', '.join(sorted(errors - route_errors))}")
+  return problems
+
+
 def build_replay(s: Scenario, CP: structs.CarParams, msgs: list, budget: dict[int, float]) -> list[Frame]:
   # what a station sends, one frame per DT
   needed = needed_frames(CP, s.rx_checks, window_frames(msgs, s.window))
@@ -178,14 +238,22 @@ def scenario_replay(s: Scenario) -> list[Frame]:
     raise RuntimeError(repr(e)) from None
 
 
+def replay_problems(s: Scenario, CP: structs.CarParams, msgs: list, budget: dict[int, float]) -> list[str]:
+  # what keeps a scenario's replay from playing its car on a station
+  replay = build_replay(s, CP, msgs, budget)
+  problems = [f"lane budget: {p}" for p in over_budget(replay, budget)]
+  problems += radar_problems(CP, window_frames(msgs, s.window), replay)
+  return problems
+
+
 def pick_replay(candidates: list[Scenario], budget: dict[int, float]) -> tuple[Scenario, list[str]]:
-  # a pair's scenarios in routes order, the first whose replay fits the station's lanes, or else the last
+  # a pair's scenarios in routes order, the first whose replay plays on a station, or else the last
   for s in candidates:
     CP, msgs = load_scenario(s)
-    lane_problems = over_budget(build_replay(s, CP, msgs, budget), budget)
-    if not lane_problems:
+    problems = replay_problems(s, CP, msgs, budget)
+    if not problems:
       break
-  return s, lane_problems
+  return s, problems
 
 
 def pick_scenarios(routes, budget: dict[int, float]) -> tuple[list[Scenario], list[str]]:
@@ -194,13 +262,13 @@ def pick_scenarios(routes, budget: dict[int, float]) -> tuple[list[Scenario], li
   scenarios = []
   for pair_candidates in candidates.values():
     try:
-      s, lane_problems = pick_replay(pair_candidates, budget)
+      s, problems = pick_replay(pair_candidates, budget)
     except Exception as e:
       first = pair_candidates[0]
       gaps.append(f"{first.car_model} {first.route}: {e!r}")
       continue
-    if lane_problems:
-      gaps.append(f"mode {s.mode} param {s.param}: lane budget: {', '.join(lane_problems)}")
+    if problems:
+      gaps.append(f"mode {s.mode} param {s.param}: {', '.join(problems)}")
     else:
       scenarios.append(s)
   return scenarios, gaps
