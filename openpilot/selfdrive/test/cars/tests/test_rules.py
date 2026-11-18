@@ -164,6 +164,24 @@ class TestRules(unittest.TestCase):
     assert len(result) == 1
     assert result[0].startswith("t=5.02 commands stopped")
 
+  def test_commands_start_late(self):
+    # no command in the first two samples of the span
+    msgs = [m for m in clean_drive(6.) if not (m.which() == 'sendcan' and m.logMonoTime < 3e9)]
+    msgs.append(selfdrive_state(2.02, True))
+    assert failures(msgs) == []
+
+  def test_commands_never_start(self):
+    msgs = [m for m in clean_drive(6.) if m.which() != 'sendcan']
+    result = failures(msgs)
+    assert len(result) == 1
+    assert "no commands while engaged" in result[0]
+
+  def test_commands_start_then_stop(self):
+    msgs = [m for m in clean_drive(8.) if not (m.which() == 'sendcan' and m.logMonoTime >= 5e9)]
+    result = failures(msgs)
+    assert len(result) == 1
+    assert "commands stopped while engaged" in result[0]
+
 
 if __name__ == "__main__":
   unittest.main()

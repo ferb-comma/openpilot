@@ -237,13 +237,23 @@ def _commands_stopped(rec: Recording) -> list[tuple[float, str]]:
   for first, last in rec.spans():
     if rec.t(rec.sd_idx[first]) < 0.:
       continue
+    # card starts sending a cycle after openpilot enables, so only a gap after the first command counts
+    started = bisect.bisect_right(sendcan_idx, rec.sd_idx[first])
+    started_idx = sendcan_idx[started] if started < len(sendcan_idx) else None
+    if started_idx is not None and started_idx > rec.sd_idx[last]:
+      started_idx = None
     for pos in range(first + 1, last + 1):
       lo = rec.sd_idx[pos - 1]
       hi = rec.sd_idx[pos]
+      if not rec.stays_enabled(hi):
+        continue
+      t = rec.t(hi)
+      if started_idx is None:
+        failures.append((t, f"t={t:.2f} no commands while engaged"))
+        break
       # at a disengage card stops one step before selfdriveState reports it
       stopped = bisect.bisect_left(sendcan_idx, hi) - bisect.bisect_right(sendcan_idx, lo) == 0
-      if stopped and rec.stays_enabled(hi):
-        t = rec.t(hi)
+      if stopped and hi > started_idx:
         failures.append((t, f"t={t:.2f} commands stopped while engaged"))
         break
   return failures
