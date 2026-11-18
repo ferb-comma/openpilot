@@ -1,19 +1,23 @@
+import hashlib
 import json
 import math
 import multiprocessing
 import os
+import pickle
+import sys
 from collections.abc import Callable, Iterable
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.parse import quote, urlparse
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
+from opendbc import DBC_PATH
 from opendbc.car import structs
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.logreader import LogReader as OpendbcLogReader
 from opendbc.car.tests.routes import CarTestRoute, routes as test_routes
-from opendbc.car.tests.test_models import COMMA_API_URL, DOWNLOAD_CACHE_ROOT, TestCarModelBase, get_cached_segment
+from opendbc.car.tests.test_models import COMMA_API_URL, DOWNLOAD_CACHE_ROOT, OPENPILOT_CI_URL, TestCarModelBase, get_cached_segment
 from opendbc.car.vin import VIN_UNKNOWN
 from opendbc.safety.tests.libsafety import libsafety_py
 
@@ -31,14 +35,14 @@ MAX_ENGAGED = 10.
 TAIL = 1.
 # the UP loops the window, so a short one keeps the wait for its next start short
 MIN_LENGTH = LEAD + MIN_ENGAGED + TAIL
-# other segments of a route searched for a window when its opendbc segment has none
-SEARCH_SEGMENTS = 10
 # a window starting before the panda's previous disengage starts this long before it, and at most MAX_LEAD before its edge
 DROP_LEAD = 1.
 MAX_LEAD = 15.
 # windows of a segment checked, its first that plays on a station is its scenario
 MAX_CANDIDATES = 4
 SCENARIOS = Path(__file__).parent / "scenarios.json"
+# each segment's data from a generation, under the version of the code that derived it
+SEGMENT_CACHE = DOWNLOAD_CACHE_ROOT / "cars_segments"
 
 
 @dataclass(frozen=True)
@@ -309,7 +313,7 @@ def load_scenario(s: Scenario) -> tuple[RouteCar, list]:
   return car_params(s.car_model, path, msgs), msgs
 
 
-def route_segments(route: str) -> list[int]:
+def api_segments(route: str) -> list[int]:
   # the segments the comma API has a log of, none if it doesn't list the route
   canonical = route.replace("/", "|")
   try:
@@ -318,6 +322,27 @@ def route_segments(route: str) -> list[int]:
   except (OSError, ValueError, KeyError):
     return []
   return sorted({int(Path(urlparse(url).path).parent.name) for url in logs})
+
+
+def ci_has(url: str) -> bool:
+  try:
+    with urlopen(Request(url, method="HEAD"), timeout=30):
+      return True
+  except OSError:
+    return False
+
+
+def ci_segments(route: str) -> list[int]:
+  # the segments the openpilot CI bucket has a log of, it can't be listed, so the ones from 0 up to the first it doesn't have
+  segments: list[int] = []
+  while any(ci_has(f"{OPENPILOT_CI_URL}/{route.replace('|', '/')}/{len(segments)}/{name}") for name in ("rlog.zst", "rlog.bz2")):
+    segments.append(len(segments))
+  return segments
+
+
+def route_segments(route: str) -> list[int]:
+  # the segments a log of can be downloaded of, the comma API doesn't list most of the test routes, the CI bucket has more of them
+  return sorted(set(api_segments(route)) | set(ci_segments(route)))
 
 
 # the scenario with its replay made faithful where it can be, and what keeps the replay from playing its car on a station,
@@ -374,13 +399,41 @@ def segment_data(route: CarTestRoute, segment: int, check: Check) -> SegmentData
   return data
 
 
-def read_route(route: CarTestRoute, segments: list[int], check: Check) -> list[SegmentData] | Exception:
+def code_version() -> str:
+  # what a segment's data derives from: opendbc's cars, DBCs and safety, and the openpilot modules loaded to check it
+  files = [f for f in Path(DBC_PATH).parent.rglob('*') if f.suffix in ('.py', '.dbc', '.h', '.c')]
+  for name, module in list(sys.modules.items()):
+    source = getattr(module, '__file__', None)
+    if name.startswith('openpilot.') and source:
+      files.append(Path(source))
+  digest = hashlib.sha256()
+  for f in sorted(set(files)):
+    digest.update(str(f).encode())
+    digest.update(f.read_bytes())
+  return digest.hexdigest()[:16]
+
+
+def cached_segment_data(route: CarTestRoute, segment: int, check: Check, version: str) -> SegmentData:
+  # a segment's data stays the same until the code that derives it changes, so a rerun only checks what's new
+  name = f"{route.car_model}_{route.route.replace('|', '_').replace('/', '_')}--{segment}--{version}.pkl"
+  path = SEGMENT_CACHE / name
+  if path.exists():
+    return pickle.loads(path.read_bytes())
+  data = segment_data(route, segment, check)
+  SEGMENT_CACHE.mkdir(parents=True, exist_ok=True)
+  tmp = path.with_suffix(f".{os.getpid()}.tmp")
+  tmp.write_bytes(pickle.dumps(data))
+  tmp.replace(path)
+  return data
+
+
+def read_route(route: CarTestRoute, segments: list[int], check: Check, version: str) -> list[SegmentData] | Exception:
   # each segment's data in order up to the first usable one, run in a worker, a failure to load any comes back as the exception
   loaded = []
   errors = []
   for segment in segments:
     try:
-      data = segment_data(route, segment, check)
+      data = cached_segment_data(route, segment, check, version)
     except Exception as e:
       errors.append(f"segment {segment}: {e!r}")
       continue
@@ -389,11 +442,6 @@ def read_route(route: CarTestRoute, segments: list[int], check: Check) -> list[S
     if data.dut_gap or data.usable():
       break
   return loaded if loaded else OSError("; ".join(errors))
-
-
-def search_segments(route: CarTestRoute, tried: list[int]) -> list[int]:
-  # the route's other segments, the first few, since a route that drove engaged usually does so early
-  return [s for s in route_segments(route.route) if s not in tried][:SEARCH_SEGMENTS]
 
 
 def build_candidates(routes, check: Check) -> tuple[dict[tuple[int, int], list[Scenario]], list[str]]:
@@ -416,9 +464,13 @@ def build_candidates(routes, check: Check) -> tuple[dict[tuple[int, int], list[S
   tried: dict[CarTestRoute, list[int]] = {}
   drivable: dict[CarTestRoute, tuple[int, int]] = {}
 
+  version = code_version()
+  workers = os.cpu_count() or 1
+  pool = ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context("spawn"))
+
   def add(route_list, segment_lists) -> None:
-    with ProcessPoolExecutor(os.cpu_count(), mp_context=multiprocessing.get_context("spawn")) as pool:
-      loaded = list(pool.map(read_route, route_list, segment_lists, [check] * len(route_list)))
+    n = len(route_list)
+    loaded = list(pool.map(read_route, route_list, segment_lists, [check] * n, [version] * n))
     for route, segments, result in zip(route_list, segment_lists, loaded, strict=True):
       # the other segments' failures only cost the search
       first = route not in tried
@@ -466,10 +518,24 @@ def build_candidates(routes, check: Check) -> tuple[dict[tuple[int, int], list[S
       engaged_from_start.add(data.pair)
 
   routes = list(routes)
-  add(routes, [[2, 1, 0] if route.segment is None else [route.segment] for route in routes])
-  searched = [route for route in routes if route in drivable and drivable[route] not in scenarios]
-  more = [search_segments(route, tried[route]) for route in searched]
-  add([route for route, segments in zip(searched, more, strict=True) if segments], [segments for segments in more if segments])
+  with pool:
+    add(routes, [[2, 1, 0] if route.segment is None else [route.segment] for route in routes])
+    # every other segment the comma API lists of the routes of each pair still without a scenario, in routes order.
+    # each round checks the next few of every such pair at once and a pair stops at its first usable one
+    searched = [route for route in routes if route in drivable and drivable[route] not in scenarios]
+    with ThreadPoolExecutor(workers) as threads:
+      listed = list(threads.map(lambda route: route_segments(route.route), searched))
+    queues: dict[tuple[int, int], list[tuple[CarTestRoute, int]]] = {}
+    for route, segments in zip(searched, listed, strict=True):
+      queues.setdefault(drivable[route], []).extend((route, s) for s in segments if s not in tried[route])
+    while True:
+      queues = {pair: queue for pair, queue in queues.items() if queue and pair not in scenarios}
+      if not queues:
+        break
+      take = -(-workers // len(queues))
+      batch = [item for queue in queues.values() for item in queue[:take]]
+      queues = {pair: queue[take:] for pair, queue in queues.items()}
+      add([route for route, _ in batch], [[segment] for _, segment in batch])
 
   # a pair the DUT can drive on some route gaps for that route's reason
   drivable_pairs = set(drivable.values())
@@ -488,7 +554,7 @@ def build_candidates(routes, check: Check) -> tuple[dict[tuple[int, int], list[S
     elif (mode, param) in engaged_once:
       gaps.append(f"mode {mode} param {param}: no engaged stretch of {MIN_ENGAGED:g} s in any route")
     else:
-      gaps.append(f"mode {mode} param {param}: never engaged in the segments of its routes searched")
+      gaps.append(f"mode {mode} param {param}: never engaged in any segment of its routes")
   return scenarios, gaps
 
 
