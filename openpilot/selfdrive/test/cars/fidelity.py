@@ -1,6 +1,7 @@
 # whether a scenario's replay plays its car like the route's window does, checked on a PC when scenarios are generated
 import logging
 from dataclasses import dataclass
+from functools import partial
 
 from opendbc.car import structs
 from opendbc.car.car_helpers import interfaces
@@ -14,7 +15,7 @@ from openpilot.selfdrive.selfdrived.state import StateMachine
 from openpilot.selfdrive.test.cars.replay import (DT, Frame, build_replay, fingerprint_problems, over_budget, packets, radar_problems,
                                                   window_frames)
 from openpilot.selfdrive.test.cars.rules import ENGAGE_LIMIT
-from openpilot.selfdrive.test.cars.scenario import MIN_ENGAGED, TAIL, RouteCar, Scenario, build_candidates, load_scenario
+from openpilot.selfdrive.test.cars.scenario import MIN_ENGAGED, TAIL, RouteCar, Scenario, build_candidates
 
 EventName = log.OnroadEvent.EventName
 ButtonType = structs.CarState.ButtonEvent.Type
@@ -277,29 +278,7 @@ def replay_problems(s: Scenario, car: RouteCar, msgs: list, budget: dict[int, fl
   return problems
 
 
-def pick_replay(candidates: list[Scenario], budget: dict[int, float]) -> tuple[Scenario, list[str]]:
-  # a pair's scenarios in routes order, the first whose replay plays on a station, or else the last
-  for s in candidates:
-    car, msgs = load_scenario(s)
-    problems = replay_problems(s, car, msgs, budget)
-    if not problems:
-      break
-  return s, problems
-
-
 def pick_scenarios(routes, budget: dict[int, float]) -> tuple[list[Scenario], list[str]]:
-  # what a rack run drives: each pair's scenario after the replay checks' fallback, and the gaps
-  candidates, gaps = build_candidates(routes)
-  scenarios = []
-  for pair_candidates in candidates.values():
-    try:
-      s, problems = pick_replay(pair_candidates, budget)
-    except Exception as e:
-      first = pair_candidates[0]
-      gaps.append(f"{first.car_model} {first.route}: {e!r}")
-      continue
-    if problems:
-      gaps.append(f"mode {s.mode} param {s.param}: {', '.join(problems)}")
-    else:
-      scenarios.append(s)
-  return scenarios, gaps
+  # what a rack run drives: each pair's first scenario whose replay plays on a station, and the gaps
+  candidates, gaps = build_candidates(routes, partial(replay_problems, budget=budget))
+  return [pair_candidates[0] for pair_candidates in candidates.values()], gaps

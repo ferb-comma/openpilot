@@ -3,7 +3,7 @@ import unittest
 from opendbc.car.structs import car
 from opendbc.car.vin import VIN_UNKNOWN
 from openpilot.selfdrive.test.test_cars import gap_report
-from openpilot.selfdrive.test.cars.scenario import DASHCAM_ONLY, MAX_ENGAGED, TAIL, Window, cached_fw, pick_window
+from openpilot.selfdrive.test.cars.scenario import DASHCAM_ONLY, DROP_LEAD, LEAD, MAX_ENGAGED, TAIL, Window, cached_fw, candidate_windows, pick_window
 
 
 def logged(vin: str = "1HGCM82633A004352", fw: int = 1, brand: str = "toyota"):
@@ -44,6 +44,19 @@ class TestPickWindow(unittest.TestCase):
   def test_no_lead_in(self):
     assert pick_window(engaged_between(3., 12.), 30.) is None
     assert pick_window(engaged_between(3., 12.), 30., lead_in=False) is not None
+
+
+class TestCandidateWindows(unittest.TestCase):
+  def test_led_in_first_then_after_drop(self):
+    # engaged 2-4 s, then from 12 s: the led-in window first, then the one with the drop at 4 s in its loop
+    samples = [(i / 2, 2. <= i / 2 < 4. or 12. <= i / 2 < 20.) for i in range(60)]
+    end = 20. + TAIL
+    assert candidate_windows(samples, 30.) == [(Window(12. - LEAD, end), 12.), (Window(3.5 - DROP_LEAD, end), 12.)]
+
+  def test_short_lead_in_after_drop(self):
+    # the drop at 10 s is less than LEAD before the edge, only the window with the drop in its loop, still LEAD before the edge
+    samples = [(i / 2, 2. <= i / 2 < 10. or 12. <= i / 2 < 20.) for i in range(60)]
+    assert candidate_windows(samples, 30.) == [(Window(12. - LEAD, 20. + TAIL), 12.)]
 
 
 class TestGapReport(unittest.TestCase):

@@ -2,9 +2,9 @@ import json
 import math
 import multiprocessing
 import os
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.parse import quote, urlparse
 from urllib.request import urlopen
@@ -33,6 +33,11 @@ TAIL = 1.
 MIN_LENGTH = LEAD + MIN_ENGAGED + TAIL
 # other segments of a route searched for a window when its opendbc segment has none
 SEARCH_SEGMENTS = 10
+# a window starting before the panda's previous disengage starts this long before it, and at most MAX_LEAD before its edge
+DROP_LEAD = 1.
+MAX_LEAD = 15.
+# windows of a segment checked, its first that plays on a station is its scenario
+MAX_CANDIDATES = 4
 SCENARIOS = Path(__file__).parent / "scenarios.json"
 
 
@@ -120,12 +125,9 @@ def can_span(msgs: Iterable) -> float:
   return (max(times) - min(times)) / 1e9 if times else 0.
 
 
-def pick_window(samples: list[tuple[float, bool]], can_end: float, lead_in: bool = True) -> tuple[Window, float] | None:
-  # the window and its engage edge, the window starts LEAD before the edge with the panda not allowed throughout,
-  # so the UP's loop of it is a lead-in, the edge, the engaged stretch and the wrap
-  # lead_in=False skips the lead-in check, to tell a missing lead-in from a missing stretch
-  best = None
-  best_len = 0.
+def stretches(samples: list[tuple[float, bool]], can_end: float) -> list[tuple[float, float, float]]:
+  # each engaged stretch as its rise, the last allowed sample before it and its seconds the window can take
+  out = []
   rise = None
   # the last allowed sample before the current stretch's rise, and before now
   allowed_before_rise = -math.inf
@@ -143,16 +145,45 @@ def pick_window(samples: list[tuple[float, bool]], can_end: float, lead_in: bool
       seen_down = True
     last = i == len(samples) - 1
     if rise is not None and (not allowed or last):
-      engaged = min((can_end if allowed else t) - rise, MAX_ENGAGED, can_end - TAIL - rise)
-      start = rise - LEAD
-      led_in = start >= 0. and allowed_before_rise < start
-      if engaged >= MIN_ENGAGED and (led_in or not lead_in) and engaged > best_len:
-        best, best_len = (start, rise), engaged
+      out.append((rise, allowed_before_rise, min((can_end if allowed else t) - rise, MAX_ENGAGED, can_end - TAIL - rise)))
       rise = None
+  return out
+
+
+def pick_window(samples: list[tuple[float, bool]], can_end: float, lead_in: bool = True) -> tuple[Window, float] | None:
+  # the window and its engage edge, the window starts LEAD before the edge with the panda not allowed throughout,
+  # so the UP's loop of it is a lead-in, the edge, the engaged stretch and the wrap
+  # lead_in=False skips the lead-in check, to tell a missing lead-in from a missing stretch
+  best = None
+  best_len = 0.
+  for rise, allowed_before_rise, engaged in stretches(samples, can_end):
+    start = rise - LEAD
+    led_in = start >= 0. and allowed_before_rise < start
+    if engaged >= MIN_ENGAGED and (led_in or not lead_in) and engaged > best_len:
+      best, best_len = (start, rise), engaged
   if best is None:
     return None
   start, rise = best
   return Window(start, rise + best_len + TAIL), rise
+
+
+def candidate_windows(samples: list[tuple[float, bool]], can_end: float) -> list[tuple[Window, float]]:
+  # every window and its engage edge, in the order they're tried: first the ones with a disengaged lead-in, longest
+  # stretch first, then the ones that start before the panda's previous disengage, so the loop drops controls
+  # the previous loop left allowed before its edge
+  led_in = []
+  after_drop = []
+  for rise, allowed_before_rise, engaged in stretches(samples, can_end):
+    if engaged < MIN_ENGAGED:
+      continue
+    end = rise + engaged + TAIL
+    if rise - LEAD >= 0. and allowed_before_rise < rise - LEAD:
+      led_in.append((engaged, Window(rise - LEAD, end), rise))
+    start = min(rise - LEAD, allowed_before_rise - DROP_LEAD)
+    if start >= 0. and rise - start <= MAX_LEAD:
+      after_drop.append((engaged, Window(start, end), rise))
+  ordered = sorted(led_in, key=lambda c: -c[0]) + sorted(after_drop, key=lambda c: -c[0])
+  return [(window, rise) for _, window, rise in ordered[:MAX_CANDIDATES]]
 
 
 def safety_pair(CP: structs.CarParams) -> tuple[int, int]:
@@ -284,42 +315,72 @@ def route_segments(route: str) -> list[int]:
   return sorted({int(Path(urlparse(url).path).parent.name) for url in logs})
 
 
-RouteData = tuple[int, tuple[int, int], str, bool, float, list[tuple[float, bool]], list[tuple[float, bool]]]
+# what keeps a scenario's replay from playing its car on a station, from the route's car and log, empty if nothing
+Check = Callable[[Scenario, RouteCar, list], list[str]]
 
 
-def segment_data(route: CarTestRoute, segment: int) -> RouteData:
+@dataclass
+class SegmentData:
+  segment: int
+  pair: tuple[int, int]
+  # why the DUT can't drive the pair
+  dut_gap: str
+  span: float
+  samples: list[tuple[float, bool]]
+  # each candidate window's scenario and its replay's problems, up to the first with none
+  checked: list[tuple[Scenario, list[str]]] = field(default_factory=list)
+  # a candidate window's route logged no commands in its engaged stretch
+  no_commands: bool = False
+
+  def usable(self) -> bool:
+    return any(not problems for _, problems in self.checked)
+
+
+def segment_data(route: CarTestRoute, segment: int, check: Check) -> SegmentData:
+  # the segment's candidate windows as scenarios, checked in order until one plays on a station
   path = cached_segment(route.route, segment)
   msgs = read_log(path)
   car = car_params(str(route.car_model), path, msgs)
-  return segment, safety_pair(car.CP), car.gap(), car.alpha_long, can_span(msgs), engaged_samples(msgs), sendcan_samples(msgs)
+  span = can_span(msgs)
+  samples = engaged_samples(msgs)
+  data = SegmentData(segment, safety_pair(car.CP), car.gap(), span, samples)
+  if data.dut_gap or span < MIN_LENGTH:
+    return data
+  try:
+    checks = rx_checks(*data.pair)
+  except ValueError:
+    # the main process gaps the route
+    return data
+  sendcan = sendcan_samples(msgs)
+  for window, rise in candidate_windows(samples, span):
+    idle = max_idle(sendcan, samples, rise)
+    if idle is None:
+      data.no_commands = True
+      continue
+    scenario = Scenario(route.route, segment, str(route.car_model), data.pair[0], data.pair[1], window, rise, checks, idle, car.alpha_long)
+    try:
+      problems = check(scenario, car, msgs)
+    except Exception as e:
+      problems = [f"replay check failed: {e!r}"]
+    data.checked.append((scenario, problems))
+    if not problems:
+      break
+  return data
 
 
-def usable(data: RouteData) -> tuple[Window, float, int] | None:
-  # the segment's window, its engage edge and command cadence, None if the DUT can't drive one from it
-  _, _, dut_gap, _, span, samples, sendcan = data
-  if dut_gap or span < MIN_LENGTH:
-    return None
-  picked = pick_window(samples, span)
-  if picked is None:
-    return None
-  window, rise = picked
-  idle = max_idle(sendcan, samples, rise)
-  return None if idle is None else (window, rise, idle)
-
-
-def read_route(route: CarTestRoute, segments: list[int]) -> list[RouteData] | Exception:
+def read_route(route: CarTestRoute, segments: list[int], check: Check) -> list[SegmentData] | Exception:
   # each segment's data in order up to the first usable one, run in a worker, a failure to load any comes back as the exception
   loaded = []
   errors = []
   for segment in segments:
     try:
-      data = segment_data(route, segment)
+      data = segment_data(route, segment, check)
     except Exception as e:
       errors.append(f"segment {segment}: {e!r}")
       continue
     loaded.append(data)
     # the car params, and so the DUT's gap, are the same in every segment
-    if data[2] or usable(data) is not None:
+    if data.dut_gap or data.usable():
       break
   return loaded if loaded else OSError("; ".join(errors))
 
@@ -329,10 +390,12 @@ def search_segments(route: CarTestRoute, tried: list[int]) -> list[int]:
   return [s for s in route_segments(route.route) if s not in tried][:SEARCH_SEGMENTS]
 
 
-def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], list[str]]:
-  # every route's scenario per pair, in routes order, so a pair can fall back to its next route.
+def build_candidates(routes, check: Check) -> tuple[dict[tuple[int, int], list[Scenario]], list[str]]:
+  # every route's scenario that plays on a station per pair, in routes order, so a pair falls back to its next route.
   # first each route's opendbc segment, then the other segments of the routes of pairs still without one
   scenarios: dict[tuple[int, int], list[Scenario]] = {}
+  # pair -> each failed candidate's problems, in routes order
+  failed: dict[tuple[int, int], list[list[str]]] = {}
   seen_pairs: set[tuple[int, int]] = set()
   engaged_from_start: set[tuple[int, int]] = set()
   no_lead_in: set[tuple[int, int]] = set()
@@ -349,7 +412,7 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
 
   def add(route_list, segment_lists) -> None:
     with ProcessPoolExecutor(os.cpu_count(), mp_context=multiprocessing.get_context("spawn")) as pool:
-      loaded = list(pool.map(read_route, route_list, segment_lists))
+      loaded = list(pool.map(read_route, route_list, segment_lists, [check] * len(route_list)))
     for route, segments, result in zip(route_list, segment_lists, loaded, strict=True):
       # the other segments' failures only cost the search
       first = route not in tried
@@ -359,42 +422,42 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
         if first:
           gaps.append(f"{who}: can't load ({result})")
         continue
-      if first and all(data[4] < MIN_LENGTH for data in result):
+      if first and all(data.span < MIN_LENGTH for data in result):
         gaps.append(f"{who}: segment shorter than {MIN_LENGTH:g} s")
       for data in result:
         add_segment(route, data)
 
-  def add_segment(route: CarTestRoute, data: RouteData) -> None:
-    segment, mode_param, dut_gap, alpha_long, span, samples, sendcan = data
-    if span < MIN_LENGTH:
+  def add_segment(route: CarTestRoute, data: SegmentData) -> None:
+    if data.span < MIN_LENGTH:
       return
     try:
-      checks = rx_checks(*mode_param)
+      rx_checks(*data.pair)
     except ValueError as e:
       gaps.append(f"{route.car_model} {route.route}: {e}")
       return
-    seen_pairs.add(mode_param)
-    if dut_gap:
-      dut_gaps[mode_param] = dut_gap
+    seen_pairs.add(data.pair)
+    if data.dut_gap:
+      dut_gaps[data.pair] = data.dut_gap
       return
-    drivable[route] = mode_param
+    drivable[route] = data.pair
+    samples = data.samples
     if not samples:
       return
     if any(allowed for _, allowed in samples):
-      engaged_once.add(mode_param)
-    picked = pick_window(samples, span)
-    if picked is not None:
-      window, rise = picked
-      idle = max_idle(sendcan, samples, rise)
-      if idle is None:
-        no_commands.add(mode_param)
-        return
-      scenario = Scenario(route.route, segment, str(route.car_model), mode_param[0], mode_param[1], window, rise, checks, idle, alpha_long)
-      scenarios.setdefault(mode_param, []).append(scenario)
-    elif pick_window(samples, span, lead_in=False) is not None:
-      no_lead_in.add(mode_param)
+      engaged_once.add(data.pair)
+    for scenario, problems in data.checked:
+      if problems:
+        failed.setdefault(data.pair, []).append(problems)
+      else:
+        scenarios.setdefault(data.pair, []).append(scenario)
+    if data.no_commands:
+      no_commands.add(data.pair)
+    if data.checked or data.no_commands:
+      return
+    if pick_window(samples, data.span, lead_in=False) is not None:
+      no_lead_in.add(data.pair)
     elif samples[0][1]:
-      engaged_from_start.add(mode_param)
+      engaged_from_start.add(data.pair)
 
   routes = list(routes)
   add(routes, [[2, 1, 0] if route.segment is None else [route.segment] for route in routes])
@@ -407,6 +470,9 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
   for mode, param in sorted(seen_pairs - scenarios.keys()):
     if (mode, param) in dut_gaps and (mode, param) not in drivable_pairs:
       gaps.append(f"mode {mode} param {param}: {dut_gaps[(mode, param)]}")
+    elif (mode, param) in failed:
+      # the first route's best window's problems
+      gaps.append(f"mode {mode} param {param}: {', '.join(failed[(mode, param)][0])}")
     elif (mode, param) in no_commands:
       gaps.append(f"mode {mode} param {param}: no logged commands in the engaged window")
     elif (mode, param) in no_lead_in:
