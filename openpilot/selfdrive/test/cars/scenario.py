@@ -6,12 +6,14 @@ from collections.abc import Iterable
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from urllib.parse import quote, urlparse
+from urllib.request import urlopen
 
 from opendbc.car import structs
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.logreader import LogReader as OpendbcLogReader
 from opendbc.car.tests.routes import CarTestRoute, routes as test_routes
-from opendbc.car.tests.test_models import TestCarModelBase, get_cached_segment
+from opendbc.car.tests.test_models import COMMA_API_URL, TestCarModelBase, get_cached_segment
 from opendbc.car.vin import VIN_UNKNOWN
 from opendbc.safety.tests.libsafety import libsafety_py
 
@@ -24,6 +26,8 @@ MIN_ENGAGED = 10.
 TAIL = 1.
 # the UP loops the window, so a short one keeps the wait for its next start short
 LENGTH = LEAD + MIN_ENGAGED + TAIL
+# other segments of a route searched for a window when its opendbc segment has none
+SEARCH_SEGMENTS = 10
 SCENARIOS = Path(__file__).parent / "scenarios.json"
 
 
@@ -252,37 +256,65 @@ def load_scenario(s: Scenario) -> tuple[RouteCar, list]:
   return car_params(s.car_model, path, msgs), msgs
 
 
-def load_route(route: CarTestRoute) -> tuple[int, RouteCar, list]:
-  segments = (2, 1, 0) if route.segment is None else (route.segment,)
-  errors = []
-  for segment in segments:
-    try:
-      path = get_cached_segment(route.route, segment)
-      msgs = read_log(path)
-    except (OSError, AssertionError) as e:
-      errors.append(f"segment {segment}: {e!r}")
-      continue
-    try:
-      return segment, car_params(str(route.car_model), path, msgs), msgs
-    except Exception as e:
-      errors.append(f"segment {segment}: can't derive safety config: {e!r}")
-  raise OSError("; ".join(errors))
+def route_segments(route: str) -> list[int]:
+  # the segments the comma API has a log of, none if it doesn't list the route
+  canonical = route.replace("/", "|")
+  try:
+    with urlopen(f"{COMMA_API_URL}/v1/route/{quote(canonical, safe='')}/files", timeout=30) as response:
+      logs = json.load(response)["logs"]
+  except (OSError, ValueError, KeyError):
+    return []
+  return sorted({int(Path(urlparse(url).path).parent.name) for url in logs})
 
 
 RouteData = tuple[int, tuple[int, int], str, bool, float, list[tuple[float, bool]], list[tuple[float, bool]]]
 
 
-def read_route(route: CarTestRoute) -> RouteData | Exception:
-  # the picklable part of a route's load, run in a worker, a failure comes back as the exception
-  try:
-    segment, car, msgs = load_route(route)
-    return segment, safety_pair(car.CP), car.gap(), car.alpha_long, can_span(msgs), engaged_samples(msgs), sendcan_samples(msgs)
-  except Exception as e:
-    return e
+def segment_data(route: CarTestRoute, segment: int) -> RouteData:
+  path = get_cached_segment(route.route, segment)
+  msgs = read_log(path)
+  car = car_params(str(route.car_model), path, msgs)
+  return segment, safety_pair(car.CP), car.gap(), car.alpha_long, can_span(msgs), engaged_samples(msgs), sendcan_samples(msgs)
+
+
+def usable(data: RouteData) -> tuple[Window, float, int] | None:
+  # the segment's window, its engage edge and command cadence, None if the DUT can't drive one from it
+  _, _, dut_gap, _, span, samples, sendcan = data
+  if dut_gap or span < LENGTH:
+    return None
+  picked = pick_window(samples, span)
+  if picked is None:
+    return None
+  window, rise = picked
+  idle = max_idle(sendcan, samples, rise)
+  return None if idle is None else (window, rise, idle)
+
+
+def read_route(route: CarTestRoute, segments: list[int]) -> list[RouteData] | Exception:
+  # each segment's data in order up to the first usable one, run in a worker, a failure to load any comes back as the exception
+  loaded = []
+  errors = []
+  for segment in segments:
+    try:
+      data = segment_data(route, segment)
+    except Exception as e:
+      errors.append(f"segment {segment}: {e!r}")
+      continue
+    loaded.append(data)
+    # the car params, and so the DUT's gap, are the same in every segment
+    if data[2] or usable(data) is not None:
+      break
+  return loaded if loaded else OSError("; ".join(errors))
+
+
+def search_segments(route: CarTestRoute, tried: list[int]) -> list[int]:
+  # the route's other segments, the first few, since a route that drove engaged usually does so early
+  return [s for s in route_segments(route.route) if s not in tried][:SEARCH_SEGMENTS]
 
 
 def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], list[str]]:
-  # every route's scenario per pair, in routes order, so a pair can fall back to its next route
+  # every route's scenario per pair, in routes order, so a pair can fall back to its next route.
+  # first each route's opendbc segment, then the other segments of the routes of pairs still without one
   scenarios: dict[tuple[int, int], list[Scenario]] = {}
   seen_pairs: set[tuple[int, int]] = set()
   engaged_from_start: set[tuple[int, int]] = set()
@@ -292,44 +324,62 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
   # pairs with an engaged window whose route logged no commands in it
   no_commands: set[tuple[int, int]] = set()
   gaps = []
-  with ProcessPoolExecutor(os.cpu_count(), mp_context=multiprocessing.get_context("spawn")) as pool:
-    loaded = list(pool.map(read_route, routes))
-  for route, result in zip(routes, loaded, strict=True):
-    who = f"{route.car_model} {route.route}"
-    if isinstance(result, Exception):
-      gaps.append(f"{who}: can't load ({result})")
-      continue
+  # route -> segments loaded, and its pair if the DUT can drive it
+  tried: dict[CarTestRoute, list[int]] = {}
+  drivable: dict[CarTestRoute, tuple[int, int]] = {}
 
-    segment, mode_param, dut_gap, alpha_long, span, samples, sendcan = result
+  def add(route_list, segment_lists) -> None:
+    with ProcessPoolExecutor(os.cpu_count(), mp_context=multiprocessing.get_context("spawn")) as pool:
+      loaded = list(pool.map(read_route, route_list, segment_lists))
+    for route, segments, result in zip(route_list, segment_lists, loaded, strict=True):
+      # the other segments' failures only cost the search
+      first = route not in tried
+      tried[route] = tried.get(route, []) + segments
+      who = f"{route.car_model} {route.route}"
+      if isinstance(result, Exception):
+        if first:
+          gaps.append(f"{who}: can't load ({result})")
+        continue
+      if first and all(data[4] < LENGTH for data in result):
+        gaps.append(f"{who}: segment shorter than {LENGTH:g} s")
+      for data in result:
+        add_segment(route, data)
+
+  def add_segment(route: CarTestRoute, data: RouteData) -> None:
+    segment, mode_param, dut_gap, alpha_long, span, samples, sendcan = data
     if span < LENGTH:
-      gaps.append(f"{who}: segment shorter than {LENGTH:g} s")
-      continue
+      return
     try:
       checks = rx_checks(*mode_param)
     except ValueError as e:
-      gaps.append(f"{who}: {e}")
-      continue
+      gaps.append(f"{route.car_model} {route.route}: {e}")
+      return
     seen_pairs.add(mode_param)
     if dut_gap:
       dut_gaps[mode_param] = dut_gap
-      continue
-
+      return
+    drivable[route] = mode_param
     if not samples:
-      gaps.append(f"{who}: no panda state logged")
-      continue
+      return
     picked = pick_window(samples, span)
     if picked is not None:
       window, rise = picked
       idle = max_idle(sendcan, samples, rise)
       if idle is None:
         no_commands.add(mode_param)
-        continue
+        return
       scenario = Scenario(route.route, segment, str(route.car_model), mode_param[0], mode_param[1], window, rise, checks, idle, alpha_long)
       scenarios.setdefault(mode_param, []).append(scenario)
     elif pick_window(samples, span, lead_in=False) is not None:
       no_lead_in.add(mode_param)
     elif samples[0][1]:
       engaged_from_start.add(mode_param)
+
+  routes = list(routes)
+  add(routes, [[2, 1, 0] if route.segment is None else [route.segment] for route in routes])
+  searched = [route for route in routes if route in drivable and drivable[route] not in scenarios]
+  more = [search_segments(route, tried[route]) for route in searched]
+  add([route for route, segments in zip(searched, more, strict=True) if segments], [segments for segments in more if segments])
 
   for mode, param in sorted(seen_pairs - scenarios.keys()):
     if (mode, param) in dut_gaps:
@@ -339,7 +389,7 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
     elif (mode, param) in no_lead_in:
       gaps.append(f"mode {mode} param {param}: no {LEAD:g} s disengaged lead-in before the engage edge")
     elif (mode, param) in engaged_from_start:
-      gaps.append(f"mode {mode} param {param}: no engage edge in segment")
+      gaps.append(f"mode {mode} param {param}: no engage edge in any segment")
     else:
       gaps.append(f"mode {mode} param {param}: no engaged stretch of {MIN_ENGAGED:g} s in any route")
   return scenarios, gaps
