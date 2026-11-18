@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import tempfile
 import time
 import unittest
 from dataclasses import dataclass
@@ -66,12 +67,17 @@ class TestCars(OpenpilotTestCase):
       scenarios = [s for s in scenarios if s.car_model in models]
 
     cls.results = [DriveResult(s) for s in scenarios]
-    drive = Drive(UP.remote())
+    log_dir = tempfile.mkdtemp(prefix="test_cars_")
+    print(f"manager logs in {log_dir}", flush=True)
+    drive = Drive(UP.remote(), log_dir)
     start = time.monotonic()
     try:
       for result in cls.results:
         cls.drive_one(drive, result)
         print(result.line(), flush=True)
+        if result.status == "failed":
+          for line in drive.log_tail(result.scenario):
+            print(f"    {line}", flush=True)
         if result.status == RIG_PROBLEM:
           break
     finally:

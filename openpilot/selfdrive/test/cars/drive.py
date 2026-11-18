@@ -62,8 +62,9 @@ def _signal_group(pgid: int, sig: signal.Signals) -> None:
 
 
 class Drive:
-  def __init__(self, up):
+  def __init__(self, up, log_dir: str):
     self.up = up
+    self.log_dir = log_dir
     self._manager: subprocess.Popen | None = None
 
   def _up(self, call: str, *args):
@@ -72,6 +73,16 @@ class Drive:
       return getattr(self.up, call)(*args)
     except Exception as e:
       raise RigProblem(f"rig problem: UP {call} failed: {e!r}") from e
+
+  def log_path(self, scenario: Scenario) -> str:
+    return os.path.join(self.log_dir, f"{scenario.car_model}_{scenario.mode}_{scenario.param}.log")
+
+  def log_tail(self, scenario: Scenario, lines: int = 15) -> list[str]:
+    try:
+      with open(self.log_path(scenario), errors="replace") as f:
+        return f.read().splitlines()[-lines:]
+    except OSError:
+      return []
 
   def _start_manager(self, scenario: Scenario) -> None:
     set_params_enabled()
@@ -86,7 +97,9 @@ class Drive:
       'BLOCK': 'soundd',
     }
     # its own process group, so stopping it leaves no processes for the next scenario
-    self._manager = subprocess.Popen(["python", os.path.join(BASEDIR, "openpilot/system/manager/manager.py")], env=env, start_new_session=True)
+    with open(self.log_path(scenario), "w") as log:
+      self._manager = subprocess.Popen(["python", os.path.join(BASEDIR, "openpilot/system/manager/manager.py")], env=env, start_new_session=True,
+                                       stdout=log, stderr=subprocess.STDOUT)
 
   def _stop_manager(self) -> None:
     if self._manager is None:
