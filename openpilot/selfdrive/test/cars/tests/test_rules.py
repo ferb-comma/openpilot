@@ -126,7 +126,7 @@ class TestRules(unittest.TestCase):
     assert lines == [
       "✓ engaged at the panda's controls_allowed edge (t=1.00, 0.50 s after)",
       "✓ 5 commands while engaged, 0 blocked by the panda",
-      "✓ commands never idle more than 0 cycles (route max 0)",
+      "✓ commands never idle more than 0 cycles (route max 0, 1 of jitter)",
       "✓ controls_allowed held while engaged (5 panda states)",
       "✓ safety mode toyota param 0 = scenario",
       "✓ no new panda faults",
@@ -267,7 +267,7 @@ class TestRules(unittest.TestCase):
     msgs.append(selfdrive_state(8.02, False))
     result = failures(msgs)
     assert len(result) == 1
-    assert result[0].startswith("t=5.02 commands stopped")
+    assert result[0].startswith("t=6.02 commands stopped")
 
   def test_commands_start_late(self):
     # no command in the first two samples of the span
@@ -296,14 +296,27 @@ class TestRules(unittest.TestCase):
     assert failures(cadence_drive(2), max_idle=1) == []
 
   def test_commands_50hz_cadence_at_100hz(self):
-    result = failures(cadence_drive(2), max_idle=0)
+    # one cycle more than the route is jitter
+    assert failures(cadence_drive(2), max_idle=0) == []
+
+  def test_commands_33hz_cadence_at_100hz(self):
+    result = failures(cadence_drive(3), max_idle=0)
     assert len(result) == 1
-    assert "commands stopped while engaged" in result[0]
+    assert "commands stopped while engaged, 2 cycles idle" in result[0]
+
+  def test_commands_stop_context(self):
+    msgs = clean_drive(3.)
+    for i in range(3):
+      msgs += [can_msg('sendcan', 5. + i, []), selfdrive_state(5.02 + i, True)]
+    msgs.append(selfdrive_state(8.02, False))
+    notes = rule_checks(msgs, TOYOTA, 0, 0)[2].notes
+    assert notes[0] == "t=6.02 idle 2000 ms since the command at t=4.00"
+    assert notes[1] == "t=6.02 sendcan: 3 in it, gaps 1000-1000 ms"
 
   def test_commands_50hz_cadence_stop(self):
     result = failures(idle(cadence_drive(2, 4.), since=3.), max_idle=1)
     assert len(result) == 1
-    assert result[0].startswith("t=3.00 commands stopped while engaged")
+    assert result[0].startswith("t=3.01 commands stopped while engaged")
 
 
 if __name__ == "__main__":

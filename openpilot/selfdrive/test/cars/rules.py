@@ -29,6 +29,9 @@ DT = 0.01
 # controlsd made from the previous carState, so a command up to two cycles after the edge still comes from before it,
 # and a recording's can message carries its frames at the time pandad read them, up to a cycle late
 TRANSITION = 3
+# a controller whose cadence depends on wall time (GM skips a steering message whose loopback came back too recently)
+# may idle a cycle more than on the route when card's cycles jitter, commands stopped is a longer run
+IDLE_JITTER = 1
 # libsafety's state the TX checks depend on
 SAFETY_STATE = ('controls_allowed', 'gas_pressed_prev', 'brake_pressed_prev', 'regen_braking_prev', 'steering_disengage_prev',
                 'cruise_engaged_prev', 'vehicle_moving', 'acc_main_on', 'relay_malfunction')
@@ -461,10 +464,30 @@ def _controls_allowed_dropped(rec: Recording) -> Check:
   return Check(f"controls_allowed held while engaged ({held} panda states)", failures)
 
 
+def _idle_context(rec: Recording, last_command: int, i: int) -> list[str]:
+  # how long the run took and whether card's cycles or the controller made it: the gaps between card's sendcan and
+  # controlsd's carControl, and what openpilot asked for at its start and end
+  t0 = rec.msgs[last_command].logMonoTime
+  t1 = rec.msgs[i].logMonoTime
+  lines = [f"idle {(t1 - t0) / 1e6:.0f} ms since the command at t={rec.t(last_command):.2f}"]
+  for which in ('sendcan', 'carControl'):
+    times = [m.logMonoTime for m in rec.msgs if m.which() == which and t0 <= m.logMonoTime <= t1]
+    gaps = [(b - a) / 1e6 for a, b in zip(times, times[1:], strict=False)]
+    if gaps:
+      lines.append(f"{which}: {len(times)} in it, gaps {min(gaps):.0f}-{max(gaps):.0f} ms")
+  for at in (last_command, i):
+    CC = _latest(rec, at, 'carControl')
+    if CC is not None:
+      lines.append(f"carControl at t={rec.t(at):.2f}: enabled {int(CC.enabled)}, latActive {int(CC.latActive)}, longActive {int(CC.longActive)}")
+  return lines
+
+
 def _commands_stopped(rec: Recording, max_idle: int) -> Check:
   # card publishes sendcan every cycle, empty on the cycles the car's controller sends nothing,
-  # so commands stopped is a run of more empty sendcan than the car's longest in its route
+  # so commands stopped is a run of more empty sendcan than the car's longest in its route and the jitter
   failures = []
+  notes = []
+  allowed = max_idle + IDLE_JITTER
   # the longest run of empty sendcan between two commands, as the route's max_idle is measured
   longest = None
   judged = False
@@ -485,29 +508,32 @@ def _commands_stopped(rec: Recording, max_idle: int) -> Check:
       continue
     run = 0
     failed = False
+    last_command = in_span[started]
     for i in in_span[started:]:
       if len(rec.msgs[i].sendcan) > 0:
         longest = max(longest or 0, run)
         run = 0
+        last_command = i
         continue
       run += 1
-      if run <= max_idle or failed:
+      if run <= allowed or failed:
         continue
       # at a disengage card stops one step before selfdriveState reports it
       pos = rec.next_sd(i)
       if pos is not None and rec.stays_enabled(rec.sd_idx[pos]):
         t = rec.t(rec.sd_idx[pos])
-        failures.append((t, f"t={t:.2f} commands stopped while engaged"))
+        failures.append((t, f"t={t:.2f} commands stopped while engaged, {run} cycles idle"))
+        notes += [f"t={t:.2f} {line}" for line in _idle_context(rec, last_command, i)]
         failed = True
   if failures:
-    return Check(f"commands idle more than the route max of {max_idle} cycles while engaged", failures)
+    return Check(f"commands idle more than the route max of {max_idle} cycles and {IDLE_JITTER} of jitter while engaged", failures, notes)
   if not judged:
     # after the engage edge failures it explains
     end = rec.t(len(rec.msgs) - 1) if rec.msgs else 0.
     return Check("no engaged span to check the commands of", [(end, "never engaged")])
   if longest is None:
     return Check(f"one command while engaged (route max idle {max_idle} cycles)", failures)
-  return Check(f"commands never idle more than {longest} cycles (route max {max_idle})", failures)
+  return Check(f"commands never idle more than {longest} cycles (route max {max_idle}, {IDLE_JITTER} of jitter)", failures)
 
 
 def _safety_pair(rec: Recording, mode: int, param: int) -> Check:
