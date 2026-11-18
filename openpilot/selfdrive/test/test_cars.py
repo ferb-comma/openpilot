@@ -14,6 +14,7 @@ from opendbc.car.structs import CarParams
 
 from openpilot.common.basedir import BASEDIR
 from openpilot.common.test import OpenpilotTestCase
+from openpilot.selfdrive.test.cars.comment import post_comment, shard_block
 from openpilot.selfdrive.test.cars.drive import Drive, DriveFailed, RigProblem
 from openpilot.selfdrive.test.cars.replay import scenario_replay
 from openpilot.selfdrive.test.cars.rules import rule_failures, summary
@@ -191,9 +192,14 @@ if __name__ == "__main__":
   program = unittest.main(testRunner=unittest.TextTestRunner(stream=sys.stdout), exit=False)
   sys.stdout.flush()
   sys.stderr.flush()
+  block = []
   for result in getattr(TestCars, "results", []):
-    print(result.line())
+    block.append(result.line())
     if result.status != "passed":
-      print(f"    {result.repeat}")
-  print(getattr(TestCars, "summary", ""), flush=True)
+      block.append(f"    {result.repeat}")
+  summary_line = getattr(TestCars, "summary", "")
+  print("\n".join([*block, summary_line]), flush=True)
+  if "ALFRED_SHARDS" in os.environ and summary_line:
+    post_comment(shard_block(block, summary_line), int(os.getenv("ALFRED_SHARD", "0")), int(os.environ["ALFRED_SHARDS"]), commit())
+    print(summary_line, flush=True)
   raise SystemExit(not program.result.wasSuccessful())
