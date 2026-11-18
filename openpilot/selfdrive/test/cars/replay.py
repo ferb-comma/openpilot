@@ -19,7 +19,11 @@ DT = 0.01
 # (addr, data, bus) of each message in a 10 ms frame
 Frame = list[tuple[int, bytes, int]]
 # frames/s of a station's lanes for buses 0-2, measured on AGNOS 20.1
-BUDGET = {0: 230., 1: 130., 2: 60.}
+LANE_RATES = {0: 230., 1: 130., 2: 60.}
+# a lane at its measured rate can drop a frame (a replay at 227 of 230 frames/s lost the one that drops controls),
+# so a replay leaves a tenth of each lane free
+HEADROOM = 0.9
+BUDGET = {bus: rate * HEADROOM for bus, rate in LANE_RATES.items()}
 # a signal changing at most once per this many seconds on average is a button, flag or state, not a continuous value
 EVENT_PERIOD = 1.
 
@@ -301,13 +305,13 @@ def presented(replay: list[Frame]) -> Fingerprint:
 
 
 def fingerprint_additions(car: RouteCar, replay: list[Frame]) -> list[tuple[int, int]]:
-  # the fewest of the route's fingerprint messages the replay drops that the DUT needs to derive its car params, none if they can't
+  # the fewest of the route's fingerprint messages the replay doesn't present, it drops them or thins them too far, that the DUT
+  # needs to derive its car params, none if they can't
   fingerprint = car.fingerprint
   shown = presented(replay)
   if _dut_problem(car, shown, replay) is None:
     return []
-  in_replay = {(bus, addr) for frame in replay for addr, _, bus in frame}
-  dropped = sorted((bus, addr) for bus, addrs in fingerprint.items() for addr in addrs if bus < BUSES and (bus, addr) not in in_replay)
+  dropped = sorted((bus, addr) for bus, addrs in fingerprint.items() for addr in addrs if bus < BUSES and addr not in shown[bus])
   # add them until the car params match, then take back the ones not needed
   restored = {bus: dict(addrs) for bus, addrs in shown.items()}
   added = []
@@ -348,7 +352,10 @@ def fingerprint_problems(car: RouteCar, replay: list[Frame]) -> list[str]:
   problem = _dut_problem(car, shown, replay)
   if problem is None:
     return []
-  return [f"{problem} on the replay's fingerprint, car params differ: {', '.join(_differs(car, shown))}"]
+  differs = _differs(car, shown)
+  if not differs:
+    return [f"{problem} on the replay, the lane budget thins the messages carState reads too far"]
+  return [f"{problem} on the replay's fingerprint, car params differ: {', '.join(differs)}"]
 
 
 @dataclass
@@ -376,6 +383,13 @@ class Replay:
     return f"replay: {len(messages)} messages, frames/s of budget {rates}, fingerprint additions: {added}"
 
 
+def fingerprint_step(frames: list[Frame], key: tuple[int, int]) -> int:
+  # every how many frames of a message the replay can keep for card to see one each FRAME_FINGERPRINT frames
+  at = [i for i, frame in enumerate(frames) for addr, _, bus in frame if (bus, addr) == key]
+  gap = max((b - a for a, b in zip(at, at[1:], strict=False)), default=FRAME_FINGERPRINT)
+  return max(1, FRAME_FINGERPRINT // gap)
+
+
 def build_replay(s: Scenario, car: RouteCar, msgs: list, budget: dict[int, float]) -> Replay:
   CP = car.dut_CP
   window = window_frames(msgs, s.window)
@@ -384,10 +398,12 @@ def build_replay(s: Scenario, car: RouteCar, msgs: list, budget: dict[int, float
   replay = thin(CP, s.rx_checks, needed, budget, steps)
   added = fingerprint_additions(car, replay)
   if added:
-    # the fingerprint messages count against the budget like the rest
-    sparse = fingerprint_frames(window, added)
+    # the fingerprint messages count against the budget like the rest: the replay's own ones thinned less, the dropped ones sparse
+    kept = {(bus, addr) for frame in needed for addr, _, bus in frame}
+    sparse = fingerprint_frames(window, [key for key in added if key not in kept])
     merged = [a + b for a, b in zip(needed, sparse, strict=True)]
-    replay = thin(CP, s.rx_checks, merged, budget, steps | dict.fromkeys(added, 1))
+    fingerprint = {key: fingerprint_step(needed, key) if key in kept else 1 for key in added}
+    replay = thin(CP, s.rx_checks, merged, budget, steps | {key: min(k, steps.get(key, k)) for key, k in fingerprint.items()})
   return Replay(replay, added, car.cache, len(car.dut_fw), car.no_fw)
 
 
