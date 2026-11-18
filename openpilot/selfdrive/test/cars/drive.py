@@ -119,6 +119,8 @@ class Drive:
     params = Params()
     params.remove("CarParamsPersistent")
     params.remove("CarParamsPrevRoute")
+    # card derives the scenario's car params with the toggle the route drove with
+    params.put_bool("AlphaLongitudinalEnabled", scenario.alpha_long)
     # FINGERPRINT also wins over a cached firmware match, so the car model doesn't depend on fuzzy firmware matching
     env = os.environ | {
       'FINGERPRINT': scenario.car_model,

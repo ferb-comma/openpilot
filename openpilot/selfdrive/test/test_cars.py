@@ -95,6 +95,8 @@ class DriveResult:
     # what was driven and the evidence for each rule, under its line
     s = self.scenario
     lines = [f"route {s.route} segment {s.segment}, window {s.window.start:.1f}-{s.window.end:.1f} s, panda engage edge at {s.rise:.1f} s"]
+    if s.alpha_long:
+      lines.append("openpilot longitudinal: AlphaLongitudinalEnabled on, as the route drove")
     if self.replay is not None:
       lines.append(self.replay.describe(BUDGET))
       lines.append(self.replay.firmware())

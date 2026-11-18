@@ -47,6 +47,8 @@ class Scenario:
   rx_checks: dict[tuple[int, int], bool]
   # the longest run of empty sendcan the car's controller has while engaged in the route, its command cadence
   max_idle: int
+  # the DUT turns on AlphaLongitudinalEnabled, the route drove with openpilot longitudinal where it's a toggle
+  alpha_long: bool
 
 
 def _first_can(msgs: list) -> int | None:
@@ -165,9 +167,9 @@ def rx_checks(mode: int, param: int) -> dict[tuple[int, int], bool]:
 Fingerprint = dict[int, dict[int, int]]
 
 
-def dut_params(car_model: str, fingerprint: Fingerprint, car_fw: list) -> structs.CarParams:
-  # as card derives them with FINGERPRINT set, the alpha long toggle unset and not a release branch
-  return interfaces[car_model].get_params(car_model, fingerprint, car_fw, False, False, docs=False)
+def dut_params(car_model: str, fingerprint: Fingerprint, car_fw: list, alpha_long: bool) -> structs.CarParams:
+  # as card derives them with FINGERPRINT set, the alpha long toggle and not a release branch
+  return interfaces[car_model].get_params(car_model, fingerprint, car_fw, alpha_long, False, docs=False)
 
 
 def logged_car_params(msgs: list):
@@ -201,12 +203,12 @@ class RouteCar:
   no_fw: str
   # the route's logged car params for CarParamsCache, None if card wouldn't use them
   cache: bytes | None
-  # the route drove with openpilot longitudinal
+  # the route drove with openpilot longitudinal where it's a toggle, so the DUT turns on AlphaLongitudinalEnabled
   alpha_long: bool
 
   def dut(self, fingerprint: Fingerprint) -> structs.CarParams:
     # the DUT's car params on another fingerprint
-    return dut_params(self.car_model, fingerprint, self.dut_fw)
+    return dut_params(self.car_model, fingerprint, self.dut_fw, self.alpha_long)
 
   def gap(self) -> str:
     # why the DUT can't drive the route's safety pair, empty if it can
@@ -216,11 +218,7 @@ class RouteCar:
       return "dashcam only in opendbc"
     if dut_pair == pair and not self.dut_CP.dashcamOnly:
       return ""
-    # what the DUT's car params need besides its firmware: the alpha long toggle the route drove with
-    with_long = interfaces[self.car_model].get_params(self.car_model, self.fingerprint, self.dut_fw, self.alpha_long, False, docs=False)
-    if self.alpha_long and safety_pair(with_long) == pair and not with_long.dashcamOnly:
-      what = "the route drove with openpilot longitudinal, the DUT has AlphaLongitudinalEnabled off"
-    elif self.no_fw:
+    if self.no_fw:
       what = f"depends on firmware, {self.no_fw}"
     else:
       what = "the DUT's car params differ with the route's firmware"
@@ -236,7 +234,9 @@ def car_params(car_model: str, path: Path, msgs: list) -> RouteCar:
   logged = logged_car_params(msgs)
   dut_fw, no_fw = cached_fw(logged)
   cache = logged.as_builder().to_bytes() if dut_fw else None
-  return RouteCar(car_model, route_CP, dut_params(cls.platform, cls.fingerprint, dut_fw), cls.fingerprint, dut_fw, no_fw, cache, alpha_long)
+  dut_long = route_CP.openpilotLongitudinalControl and route_CP.alphaLongitudinalAvailable
+  dut_CP = dut_params(cls.platform, cls.fingerprint, dut_fw, dut_long)
+  return RouteCar(car_model, route_CP, dut_CP, cls.fingerprint, dut_fw, no_fw, cache, dut_long)
 
 
 def read_log(path: Path) -> list:
@@ -268,14 +268,14 @@ def load_route(route: CarTestRoute) -> tuple[int, RouteCar, list]:
   raise OSError("; ".join(errors))
 
 
-RouteData = tuple[int, tuple[int, int], str, float, list[tuple[float, bool]], list[tuple[float, bool]]]
+RouteData = tuple[int, tuple[int, int], str, bool, float, list[tuple[float, bool]], list[tuple[float, bool]]]
 
 
 def read_route(route: CarTestRoute) -> RouteData | Exception:
   # the picklable part of a route's load, run in a worker, a failure comes back as the exception
   try:
     segment, car, msgs = load_route(route)
-    return segment, safety_pair(car.CP), car.gap(), can_span(msgs), engaged_samples(msgs), sendcan_samples(msgs)
+    return segment, safety_pair(car.CP), car.gap(), car.alpha_long, can_span(msgs), engaged_samples(msgs), sendcan_samples(msgs)
   except Exception as e:
     return e
 
@@ -299,7 +299,7 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
       gaps.append(f"{who}: can't load ({result})")
       continue
 
-    segment, mode_param, dut_gap, span, samples, sendcan = result
+    segment, mode_param, dut_gap, alpha_long, span, samples, sendcan = result
     if span < LENGTH:
       gaps.append(f"{who}: segment shorter than {LENGTH:g} s")
       continue
@@ -323,7 +323,7 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
       if idle is None:
         no_commands.add(mode_param)
         continue
-      scenario = Scenario(route.route, segment, str(route.car_model), mode_param[0], mode_param[1], window, rise, checks, idle)
+      scenario = Scenario(route.route, segment, str(route.car_model), mode_param[0], mode_param[1], window, rise, checks, idle, alpha_long)
       scenarios.setdefault(mode_param, []).append(scenario)
     elif pick_window(samples, span, lead_in=False) is not None:
       no_lead_in.add(mode_param)
