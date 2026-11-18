@@ -10,7 +10,7 @@ import openpilot.cereal.messaging as messaging
 from openpilot.common.basedir import BASEDIR
 from openpilot.common.params import Params
 from openpilot.selfdrive.test.helpers import set_params_enabled
-from openpilot.selfdrive.test.cars.replay import DT, Frame
+from openpilot.selfdrive.test.cars.replay import DT, Frame, Replay
 from openpilot.selfdrive.test.cars.rules import NO_CAR_MODES, is_event, log_line
 from openpilot.selfdrive.test.cars.scenario import Scenario
 
@@ -36,11 +36,8 @@ class DriveFailed(Exception):
 @dataclass
 class DriveLog:
   msgs: list
-  # seconds from manager start to onroad
-  onroad: float
-  # logMonoTime and seconds of the recording window
+  # logMonoTime the recording window starts at
   start: int
-  length: float
 
 
 def onroad_missing(sm) -> list[str]:
@@ -81,6 +78,8 @@ class Drive:
     self.up = up
     self._manager: subprocess.Popen | None = None
     self._started = 0.
+    # seconds of each phase of the last run, in order
+    self.timing: dict[str, float] = {}
 
   def _up(self, call: str, *args):
     # the UP not answering is the rack's problem
@@ -185,8 +184,10 @@ class Drive:
     self._check_manager()
     return msgs
 
-  def run(self, scenario: Scenario, frames: list[Frame]) -> DriveLog:
+  def run(self, scenario: Scenario, replay: Replay) -> DriveLog:
     # the UP loops the window from its call until reset, each loop a lead-in, the engage edge, the engaged stretch and the wrap
+    self.timing = {}
+    frames = replay.frames
     buses = {bus for frame in frames for _, _, bus in frame}
     sm = messaging.SubMaster(['deviceState', 'carState', 'managerState', 'pandaStates'])
     can_sock = messaging.sub_sock('can', conflate=False)
@@ -206,16 +207,23 @@ class Drive:
       # the loop's 10 ms clock starts as can_replay returns
       t0 = time.monotonic()
       period = len(frames) * DT
-      onroad = self._wait_onroad(sm, can_sock, error_sock, errors, buses)
+      self.timing['manager start → onroad'] = self._wait_onroad(sm, can_sock, error_sock, errors, buses)
       # record from the next loop start through its engage edge and the engaged stretch after it
       start = t0 + math.ceil((time.monotonic() - t0) / period) * period
       end = start + (scenario.rise - scenario.window.start) + ENGAGED_RECORD
-      return DriveLog(self._record(start, end, error_sock, errors) + errors, onroad, int(start * 1e9), end - start)
+      self.timing['wait for loop'] = start - self._started - self.timing['manager start → onroad']
+      msgs = self._record(start, end, error_sock, errors)
+      self.timing['record'] = time.monotonic() - start
+      return DriveLog(msgs + errors, int(start * 1e9))
     finally:
+      stopping = time.monotonic()
       try:
         self._up('reset')
       finally:
-        self._stop_manager()
+        try:
+          self._stop_manager()
+        finally:
+          self.timing['stop'] = time.monotonic() - stopping
 
   def close(self) -> None:
     try:

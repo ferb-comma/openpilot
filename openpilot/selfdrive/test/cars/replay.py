@@ -2,6 +2,7 @@ import logging
 import math
 from collections import Counter
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 from opendbc.can.dbc import DBC, Msg, SignalType
 from opendbc.can.packer import CANPacker
@@ -326,21 +327,35 @@ def fingerprint_problems(car_model: str, CP: structs.CarParams, replay: list[Fra
   return [f"{problem} on the replay's fingerprint, car params differ: {', '.join(_differs(car_model, CP, shown))}"]
 
 
-def build_replay(s: Scenario, CP: structs.CarParams, fingerprint: Fingerprint, msgs: list, budget: dict[int, float]) -> list[Frame]:
-  # what a station sends, one frame per DT
+@dataclass
+class Replay:
+  # what a station sends, one frame per DT, and the route's fingerprint messages added for the DUT's car params
+  frames: list[Frame]
+  added: list[tuple[int, int]]
+
+  def describe(self, budget: dict[int, float]) -> str:
+    seconds = len(self.frames) * DT
+    load = Counter(bus for f in self.frames for _, _, bus in f)
+    messages = {(bus, addr) for f in self.frames for addr, _, bus in f}
+    rates = ", ".join(f"bus {bus} {load[bus] / seconds:.0f}/{rate:.0f}" for bus, rate in sorted(budget.items()))
+    added = ", ".join(f"{addr:#x} bus {bus}" for bus, addr in self.added) or "none"
+    return f"replay: {len(messages)} messages, frames/s of budget {rates}, fingerprint additions: {added}"
+
+
+def build_replay(s: Scenario, CP: structs.CarParams, fingerprint: Fingerprint, msgs: list, budget: dict[int, float]) -> Replay:
   window = window_frames(msgs, s.window)
   needed = needed_frames(CP, s.rx_checks, window)
   replay = thin(CP, s.rx_checks, needed, budget)
   added = fingerprint_additions(s.car_model, CP, fingerprint, replay)
   if not added:
-    return replay
+    return Replay(replay, [])
   # the fingerprint messages count against the budget like the rest
   sparse = fingerprint_frames(window, added)
   merged = [a + b for a, b in zip(needed, sparse, strict=True)]
-  return thin(CP, s.rx_checks, merged, budget, set(added))
+  return Replay(thin(CP, s.rx_checks, merged, budget, set(added)), added)
 
 
-def scenario_replay(s: Scenario) -> list[Frame]:
+def scenario_replay(s: Scenario) -> Replay:
   # a scenario's replay from its route, built in a worker while the previous car drives
   try:
     CP, fingerprint, msgs = load_scenario(s)
@@ -352,7 +367,7 @@ def scenario_replay(s: Scenario) -> list[Frame]:
 
 def replay_problems(s: Scenario, CP: structs.CarParams, fingerprint: Fingerprint, msgs: list, budget: dict[int, float]) -> list[str]:
   # what keeps a scenario's replay from playing its car on a station
-  replay = build_replay(s, CP, fingerprint, msgs, budget)
+  replay = build_replay(s, CP, fingerprint, msgs, budget).frames
   problems = fingerprint_problems(s.car_model, CP, replay)
   problems += [f"lane budget: {p}" for p in over_budget(replay, budget)]
   problems += radar_problems(CP, window_frames(msgs, s.window), replay)

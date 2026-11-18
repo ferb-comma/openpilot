@@ -4,7 +4,7 @@ import unittest
 from opendbc.car.structs import CarParams
 
 from openpilot.cereal.messaging import new_message
-from openpilot.selfdrive.test.cars.rules import is_event, log_line, rule_failures
+from openpilot.selfdrive.test.cars.rules import is_event, log_line, rule_checks, rule_failures
 
 TOYOTA = int(CarParams.SafetyModel.toyota)
 
@@ -90,6 +90,23 @@ def failures(msgs, max_idle=0):
 class TestRules(unittest.TestCase):
   def test_clean_drive(self):
     assert failures(clean_drive()) == []
+
+  def test_clean_drive_evidence(self):
+    lines = [line for check in rule_checks(clean_drive(), TOYOTA, 0, 0) for line in check.lines()]
+    assert lines == [
+      "✓ engaged at the panda's controls_allowed edge (t=1.00, 0.50 s after)",
+      "✓ 5 commands while engaged, 0 blocked by the panda",
+      "✓ commands never idle more than 0 cycles (route max 0)",
+      "✓ controls_allowed held while engaged (5 panda states)",
+      "✓ safety mode toyota param 0 = scenario",
+      "✓ no new panda faults",
+    ]
+
+  def test_blocked_evidence(self):
+    msgs = clean_drive()
+    msgs.append(can_msg('can', 3.05, [(0x100, 192)]))
+    blocked = rule_checks(msgs, TOYOTA, 0, 0)[1]
+    assert blocked.lines() == ["✗ 5 commands while engaged, 1 blocked by the panda", "  t=3.05 blocked while engaged, addr 0x100 bus 0"]
 
   def test_brake_disengage(self):
     # the panda drops controls and blocks commands, openpilot disengages right after

@@ -8,20 +8,17 @@ import time
 import unittest
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
-from dataclasses import dataclass
-
-from opendbc.car.structs import CarParams
+from dataclasses import dataclass, field
 
 from openpilot.common.basedir import BASEDIR
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.test.cars.drive import Drive, DriveFailed, RigProblem
-from openpilot.selfdrive.test.cars.replay import scenario_replay
-from openpilot.selfdrive.test.cars.rules import rule_failures, summary
+from openpilot.selfdrive.test.cars.replay import BUDGET, Replay, scenario_replay
+from openpilot.selfdrive.test.cars.rules import SAFETY_MODELS, Check, failure_lines, rule_checks, summary
 from openpilot.selfdrive.test.cars.scenario import Scenario, load_scenarios
 
 NOT_DRIVEN = "not driven"
 RIG_PROBLEM = "rig problem"
-SAFETY_MODELS = {v: k for k, v in CarParams.SafetyModel.schema.enumerants.items()}
 
 
 def commit() -> str:
@@ -47,11 +44,12 @@ class DriveResult:
   status: str = NOT_DRIVEN
   error: str = ""
   failures: list[str] | None = None
+  checks: list[Check] | None = None
+  replay: Replay | None = None
   stats: str = ""
   took: float = 0.
-  # seconds from manager start to onroad
-  onroad: float | None = None
-  recorded: float = 0.
+  # seconds of each phase of the drive
+  timing: dict[str, float] = field(default_factory=dict)
 
   @property
   def name(self) -> str:
@@ -72,13 +70,31 @@ class DriveResult:
 
   @property
   def times(self) -> str:
-    onroad = f"onroad {self.onroad:.0f} s, recorded {self.recorded:.0f} s, " if self.onroad is not None else ""
-    return f"{onroad}{self.took:.0f} s"
+    onroad = self.timing.get('manager start → onroad')
+    recorded = self.timing.get('record')
+    onroad_text = f"onroad {onroad:.0f} s, " if onroad is not None else ""
+    recorded_text = f"recorded {recorded:.0f} s, " if recorded is not None else ""
+    return f"{onroad_text}{recorded_text}{self.took:.0f} s"
 
   def line(self) -> str:
     if self.status == "passed":
       return f"✅ {self.name}  {self.stats}  {self.times}"
     return f"❌ {self.name}  {self.first_failure}  {self.times}"
+
+  def details(self) -> list[str]:
+    # what was driven and the evidence for each rule, under its line
+    s = self.scenario
+    lines = [f"route {s.route} segment {s.segment}, window {s.window.start:.1f}-{s.window.end:.1f} s, panda engage edge at {s.rise:.1f} s"]
+    if self.replay is not None:
+      lines.append(self.replay.describe(BUDGET))
+    if self.error:
+      lines += self.error.splitlines()
+    for check in self.checks or []:
+      lines += check.lines()
+    if self.timing:
+      phases = ", ".join(f"{name} {seconds:.1f} s" for name, seconds in self.timing.items())
+      lines.append(f"time: {phases}, total {self.took:.0f} s")
+    return [f"    {line}" for line in lines]
 
 
 # every car's engaged route window on a DUT in an ultimate provisioning (UP) station, the UP plays the car.
@@ -137,6 +153,7 @@ class TestCars(OpenpilotTestCase):
           print(f"=== {result.name} ===", flush=True)
           cls.drive_one(drive, result, current)
         print(result.line(), flush=True)
+        print("\n".join(result.details()), flush=True)
         if result.status == "failed":
           print(f"    {result.repeat}", flush=True)
         if result.status == RIG_PROBLEM:
@@ -155,11 +172,12 @@ class TestCars(OpenpilotTestCase):
   def drive_one(drive: Drive, result: DriveResult, replay: Future) -> None:
     s = result.scenario
     start = time.monotonic()
+    drive.timing = {}
     try:
-      log = drive.run(s, replay.result())
-      result.onroad = log.onroad
-      result.recorded = log.length
-      result.failures = rule_failures(log.msgs, s.mode, s.param, s.max_idle, start=log.start)
+      result.replay = replay.result()
+      log = drive.run(s, result.replay)
+      result.checks = rule_checks(log.msgs, s.mode, s.param, s.max_idle, start=log.start)
+      result.failures = failure_lines(result.checks)
       result.stats = summary(log.msgs, start=log.start)
       result.status = "passed" if not result.failures else "failed"
     except RigProblem as e:
@@ -172,6 +190,7 @@ class TestCars(OpenpilotTestCase):
       result.status = "failed"
       result.error = repr(e)
     result.took = time.monotonic() - start
+    result.timing = dict(drive.timing)
 
   def test_something_driven(self):
     assert not self.unmatched, f"SCENARIOS matched nothing for: {', '.join(self.unmatched)}"
