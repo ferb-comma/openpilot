@@ -1,9 +1,10 @@
+import json
 import unittest
 
 from opendbc.car.structs import CarParams
 
 from openpilot.cereal.messaging import new_message
-from openpilot.selfdrive.test.cars.rules import rule_failures
+from openpilot.selfdrive.test.cars.rules import log_line, rule_failures
 
 TOYOTA = int(CarParams.SafetyModel.toyota)
 
@@ -29,6 +30,12 @@ def onroad_events(t, name, **flags):
   msg.onroadEvents[0].name = name
   for flag, value in flags.items():
     setattr(msg.onroadEvents[0], flag, value)
+  return msg
+
+
+def error_log(t, record):
+  msg = new_message(None, errorLogMessage=json.dumps(record))
+  msg.logMonoTime = int(t * 1e9)
   return msg
 
 
@@ -91,6 +98,21 @@ class TestRules(unittest.TestCase):
   def test_not_engaged_no_events(self):
     msgs = [panda_state(0., False), selfdrive_state(0., False), panda_state(1., True), selfdrive_state(3.5, False)]
     assert "no onroadEvents recorded" in failures(msgs)[0]
+
+  def test_not_engaged_comm_issue_services(self):
+    msgs = [panda_state(0., False), selfdrive_state(0., False)]
+    msgs.append(error_log(0.4, {'msg': {'event': 'commIssue', 'invalid': ['carState'], 'not_alive': ['radarState', 'modelV2'], 'not_freq_ok': []}}))
+    msgs += [onroad_events(0.5, 'commIssue', noEntry=True, softDisable=True), panda_state(1., True), selfdrive_state(3.5, False)]
+    result = failures(msgs)
+    assert len(result) == 1
+    assert result[0].endswith("commIssue: invalid [carState], not alive [radarState, modelV2]")
+
+  def test_log_line(self):
+    record = {'msg': 'card crashed', 'ctx': {'daemon': 'card'}, 'exc_info': 'Traceback\n  File "card.py"\nKeyError: 1\n'}
+    assert log_line(json.dumps(record)) == "card: KeyError: 1"
+    record = {'msg': {'event': 'fingerprinted', 'car_fingerprint': 'MAZDA_6'}, 'ctx': {'daemon': 'card'}}
+    assert log_line(json.dumps(record)) == 'card: {"event": "fingerprinted", "car_fingerprint": "MAZDA_6"}'
+    assert log_line("not json\nline 2") == "?: not json line 2"
 
   def test_warmup(self):
     # openpilot doesn't engage on either edge, only the one after the warmup is judged

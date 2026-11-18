@@ -1,4 +1,5 @@
 import bisect
+import json
 from dataclasses import dataclass
 
 from opendbc.car.structs import CarParams
@@ -8,6 +9,7 @@ ENGAGE_LIMIT = 2.
 # the panda marks what it sent with src + 128 and what it blocked with src + 192
 BLOCKED = 192
 BUSES = 3
+LOG_LINE_LIMIT = 200
 NO_CAR_MODES = (
   int(CarParams.SafetyModel.noOutput),
   int(CarParams.SafetyModel.silent),
@@ -95,10 +97,39 @@ def _panda_states(rec: Recording):
 BLOCKING_FLAGS = ('noEntry', 'softDisable', 'immediateDisable', 'userDisable')
 
 
+def log_record(text: str) -> dict:
+  try:
+    record = json.loads(text)
+  except ValueError:
+    return {'msg': text}
+  return record if isinstance(record, dict) else {'msg': text}
+
+
+def log_line(text: str) -> str:
+  # a cloudlog record in one short line, its process and message, or the last line of its exception
+  record = log_record(text)
+  msg = record.get('msg', '')
+  if record.get('exc_info'):
+    msg = record['exc_info'].strip().splitlines()[-1]
+  elif not isinstance(msg, str):
+    msg = json.dumps(msg)
+  daemon = record.get('ctx', {}).get('daemon', '?')
+  line = ' '.join(f"{daemon}: {msg}".split())
+  return line[:LOG_LINE_LIMIT]
+
+
+def _comm_issue(log: dict | None) -> str:
+  # the services selfdrived logs with its commIssue event
+  if log is None:
+    return "commIssue: no log recorded"
+  return f"commIssue: invalid [{', '.join(log.get('invalid', []))}], not alive [{', '.join(log.get('not_alive', []))}]"
+
+
 def _openpilot_reasons(rec: Recording, end: float) -> str:
-  # latest selfdriveState and onroadEvents at or before end
+  # latest selfdriveState, onroadEvents and commIssue log at or before end
   state = None
   events = None
+  comm_issue = None
   for i, msg in enumerate(rec.msgs):
     if rec.t(i) > end:
       break
@@ -106,6 +137,10 @@ def _openpilot_reasons(rec: Recording, end: float) -> str:
       state = msg.selfdriveState
     elif msg.which() == 'onroadEvents':
       events = msg.onroadEvents
+    elif msg.which() == 'errorLogMessage':
+      log = log_record(msg.errorLogMessage).get('msg')
+      if isinstance(log, dict) and log.get('event') == 'commIssue':
+        comm_issue = log
   parts = []
   if state is not None:
     parts.append(f"state {state.state}, engageable {state.engageable}")
@@ -118,6 +153,8 @@ def _openpilot_reasons(rec: Recording, end: float) -> str:
       if flags:
         names.append(f"{event.name} ({', '.join(flags)})")
     parts.append(f"events [{', '.join(names)}]")
+    if any(str(event.name) == 'commIssue' for event in events):
+      parts.append(_comm_issue(comm_issue))
   return ", ".join(parts)
 
 

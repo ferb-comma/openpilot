@@ -9,13 +9,13 @@ from openpilot.common.basedir import BASEDIR
 from openpilot.common.params import Params
 from openpilot.selfdrive.test.helpers import set_params_enabled
 from openpilot.selfdrive.test.cars.replay import DT, Frame
-from openpilot.selfdrive.test.cars.rules import NO_CAR_MODES
+from openpilot.selfdrive.test.cars.rules import NO_CAR_MODES, log_line
 from openpilot.selfdrive.test.cars.scenario import LENGTH, Scenario
 
 ONROAD_LIMIT = 120.
 # a warmup loop, then one full loop of the window, the rules judge the second
 RECORD_TIME = 2 * LENGTH
-RECORD = ('can', 'sendcan', 'pandaStates', 'selfdriveState', 'carState', 'onroadEvents')
+RECORD = ('can', 'sendcan', 'pandaStates', 'selfdriveState', 'carState', 'onroadEvents', 'managerState', 'errorLogMessage')
 # the panda marks its own tx echoes with src + 128
 ECHO = 128
 
@@ -118,20 +118,30 @@ class Drive:
       sm.update(10)
     return sm['pandaStates'][0]
 
-  def _wait_onroad(self, sm, can_sock, buses: set[int]) -> None:
+  def _wait_onroad(self, sm, can_sock, error_sock, buses: set[int]) -> None:
     seen: set[int] = set()
+    # the last error any process logged, and the last card logged
+    last_error = ""
+    card_error = ""
     end = time.monotonic() + ONROAD_LIMIT
     while True:
       self._check_manager()
       sm.update(10)
       for m in messaging.drain_sock(can_sock):
         seen |= {c.src for c in m.can if c.src < ECHO}
+      for m in messaging.drain_sock(error_sock):
+        last_error = log_line(m.errorLogMessage)
+        if last_error.startswith("card: "):
+          card_error = last_error
       missing = onroad_missing(sm)
       if buses - seen:
         missing.append(f"no CAN on bus {sorted(buses - seen)}")
       if not missing:
         return
       if time.monotonic() > end:
+        error = card_error or last_error
+        if error:
+          missing.append(f"last error {error}")
         raise DriveFailed(f"not onroad after {ONROAD_LIMIT:g} s: {', '.join(missing)}")
 
   def _record(self) -> list:
@@ -155,6 +165,7 @@ class Drive:
     buses = {bus for frame in frames for _, _, bus in frame}
     sm = messaging.SubMaster(['deviceState', 'carState', 'managerState', 'pandaStates'])
     can_sock = messaging.sub_sock('can', conflate=False)
+    error_sock = messaging.sub_sock('errorLogMessage', conflate=False)
     self._start_manager(scenario)
     try:
       self._up('reset')
@@ -165,7 +176,7 @@ class Drive:
       for bus in fd_buses(frames):
         self._up('set_can_data_speed_kbps', bus, can_states[bus].canDataSpeed)
       self._up('can_replay', frames)
-      self._wait_onroad(sm, can_sock, buses)
+      self._wait_onroad(sm, can_sock, error_sock, buses)
       return self._record()
     finally:
       try:
