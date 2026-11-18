@@ -1,9 +1,12 @@
 import bisect
 import json
 import os
+import subprocess
+import tempfile
 from contextlib import suppress
 from dataclasses import dataclass, field
 from functools import cached_property
+from pathlib import Path
 
 from opendbc.can.dbc import DBC, Msg, SignalType
 from opendbc.car.structs import CarParams
@@ -273,30 +276,29 @@ def panda_release() -> bool:
     return f.read().strip().endswith("-RELEASE")
 
 
+def build_libsafety(debug: bool) -> str:
+  # libsafety like the panda's firmware, without instrumentation: a device has neither the UBSan nor the gcov runtime
+  # that libsafety_py's own builds link against. ALLOW_DEBUG is the only define that changes the safety logic
+  libsafety_dir = Path(libsafety_py.__file__).parent
+  root = str(libsafety_dir.parents[3])
+  so = Path(tempfile.mkdtemp()) / "libsafety.so"
+  define = ['-DALLOW_DEBUG'] if debug else []
+  subprocess.check_call(['cc', '-fPIC', '-shared', '-std=gnu11', '-O0', '-nostdlib', '-fno-builtin', *define, '-I', root,
+                         str(libsafety_dir / "safety.c"), '-o', str(so)])
+  return str(so)
+
+
 def load_libsafety():
-  # libsafety built like the panda's firmware to replay a recording through, and why there is none. a device has no UBSan
-  # runtime for the default build, so there it builds without the sanitizer, libsafety_py's debug build without it has coverage
+  # libsafety built like the panda's firmware to replay a recording through, and why there is none
   try:
     release = panda_release()
   except OSError as e:
     return None, f"no panda firmware build to match: {e!r}"
-  if not release:
-    try:
-      return libsafety_py.libsafety, ""
-    except Exception:
-      pass
-  coverage = os.environ.get("SAFETY_COVERAGE")
-  os.environ["SAFETY_COVERAGE"] = "1"
   try:
-    libsafety_py.load(libsafety_py._build_libsafety(release=release))
+    libsafety_py.load(build_libsafety(debug=not release))
     return libsafety_py.libsafety, ""
   except Exception as e:
     return None, f"libsafety doesn't build here: {e!r}"
-  finally:
-    if coverage is None:
-      del os.environ["SAFETY_COVERAGE"]
-    else:
-      os.environ["SAFETY_COVERAGE"] = coverage
 
 
 @dataclass
