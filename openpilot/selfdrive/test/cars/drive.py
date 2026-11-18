@@ -11,7 +11,7 @@ from openpilot.common.basedir import BASEDIR
 from openpilot.common.params import Params
 from openpilot.selfdrive.test.helpers import set_params_enabled
 from openpilot.selfdrive.test.cars.replay import DT, Frame
-from openpilot.selfdrive.test.cars.rules import NO_CAR_MODES, log_line
+from openpilot.selfdrive.test.cars.rules import NO_CAR_MODES, is_event, log_line
 from openpilot.selfdrive.test.cars.scenario import Scenario
 
 # seconds from manager start, ~2x the measured normal onroad time (20-25 s)
@@ -143,7 +143,7 @@ class Drive:
 
   def _wait_onroad(self, sm, can_sock, error_sock, errors: list, buses: set[int]) -> float:
     seen: set[int] = set()
-    # the last error any process logged, and the last card logged
+    # the last real error any process logged (not an informational event), and the last card logged
     last_error = ""
     card_error = ""
     end = self._started + ONROAD_LIMIT
@@ -154,6 +154,8 @@ class Drive:
         seen |= {c.src for c in m.can if c.src < ECHO}
       for m in messaging.drain_sock(error_sock):
         errors.append(m)
+        if is_event(m.errorLogMessage):
+          continue
         last_error = log_line(m.errorLogMessage)
         if last_error.startswith("card: "):
           card_error = last_error

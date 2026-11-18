@@ -4,7 +4,7 @@ import unittest
 from opendbc.car.structs import CarParams
 
 from openpilot.cereal.messaging import new_message
-from openpilot.selfdrive.test.cars.rules import log_line, rule_failures
+from openpilot.selfdrive.test.cars.rules import is_event, log_line, rule_failures
 
 TOYOTA = int(CarParams.SafetyModel.toyota)
 
@@ -122,6 +122,13 @@ class TestRules(unittest.TestCase):
     record = {'msg': {'event': 'fingerprinted', 'car_fingerprint': 'MAZDA_6'}, 'ctx': {'daemon': 'card'}}
     assert log_line(json.dumps(record)) == 'card: {"event": "fingerprinted", "car_fingerprint": "MAZDA_6"}'
     assert log_line("not json\nline 2") == "?: not json line 2"
+
+  def test_is_event(self):
+    event = {'msg': {'event': 'fingerprinted', 'car_fingerprint': 'MAZDA_6'}, 'ctx': {'daemon': 'card'}}
+    assert is_event(json.dumps(event))
+    assert not is_event(json.dumps({'msg': 'dashcamOnly: SecOC is unsupported', 'ctx': {'daemon': 'card'}}))
+    assert not is_event(json.dumps({'msg': {'event': 'x'}, 'exc_info': 'Traceback\nKeyError: 1\n'}))
+    assert not is_event("not json")
 
   def test_start(self):
     # openpilot doesn't engage on either edge, only the one after the recording window's start is judged

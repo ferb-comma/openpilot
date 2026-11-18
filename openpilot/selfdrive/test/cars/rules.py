@@ -106,6 +106,12 @@ def log_record(text: str) -> dict:
   return record if isinstance(record, dict) else {'msg': text}
 
 
+def is_event(text: str) -> bool:
+  # cloudlog.event records carry a dict instead of a message and no exception
+  record = log_record(text)
+  return isinstance(record.get('msg'), dict) and not record.get('exc_info')
+
+
 def log_line(text: str) -> str:
   # a cloudlog record in one short line, its process and message, or the last line of its exception
   record = log_record(text)
