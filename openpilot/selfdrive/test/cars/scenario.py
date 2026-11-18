@@ -84,9 +84,10 @@ def sendcan_samples(msgs: list) -> list[tuple[float, bool]]:
   return [((m.logMonoTime - first) / 1e9, len(m.sendcan) > 0) for m in msgs if m.which() == 'sendcan']
 
 
-def max_idle(sendcan: list[tuple[float, bool]], samples: list[tuple[float, bool]], window: Window, rise: float) -> int | None:
-  # the longest run of empty sendcan between two commands in the window's engaged stretch, None without two commands
-  stop = window.end
+def max_idle(sendcan: list[tuple[float, bool]], samples: list[tuple[float, bool]], rise: float) -> int | None:
+  # the longest run of empty sendcan between two commands in the segment's whole engaged stretch from rise, not just the window's part,
+  # a short window can miss the car's slower cadence. None without two commands
+  stop = math.inf
   for t, allowed in samples:
     if t > rise and not allowed:
       stop = min(stop, t)
@@ -319,7 +320,7 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
     picked = pick_window(samples, span)
     if picked is not None:
       window, rise = picked
-      idle = max_idle(sendcan, samples, window, rise)
+      idle = max_idle(sendcan, samples, rise)
       if idle is None:
         no_commands.add(mode_param)
         continue
