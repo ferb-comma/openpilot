@@ -403,7 +403,7 @@ def _decoded(dbcs: list[DBC], addr: int, dat: bytes) -> str:
 
 
 def block_context(rec: Recording, i: int, frame, decision: Decision | None, dbcs: list[DBC]) -> list[str]:
-  # the panda's, libsafety's and openpilot's view when the panda blocked a frame
+  # the panda's, libsafety's and openpilot's view when they decided differently on a frame
   lines = [f"frame: {_decoded(dbcs, frame.address, bytes(frame.dat))}"]
   panda = _latest(rec, i, 'pandaStates')
   if panda is not None and len(panda):
@@ -423,8 +423,9 @@ def block_context(rec: Recording, i: int, frame, decision: Decision | None, dbcs
 
 
 def _blocked_while_engaged(rec: Recording, mode: int, param: int, safety, why_not: str, dbcs: list[DBC]) -> Check:
-  # a block is a failure unless libsafety, fed the same rx, blocks it too right after its state changed, a transition
-  # openpilot reacts to a cycle later. without libsafety every block is
+  # the panda and libsafety, fed the same rx, have to decide the same on each command: a block libsafety allows or a command
+  # libsafety blocks is a failure, unless libsafety blocks it right after its state changed, a transition openpilot reacts to
+  # a cycle later. without libsafety every block is
   decisions = safety_decisions(rec, mode, param, safety) if safety is not None else {}
   failures = []
   notes = []
@@ -432,8 +433,9 @@ def _blocked_while_engaged(rec: Recording, mode: int, param: int, safety, why_no
   commands = 0
   blocked = 0
   transitions = 0
-  # frames the panda sent that libsafety blocks, libsafety's replay differs from the panda there
-  oracle_only = 0
+  # commands the panda sent that libsafety blocks, and how many of them at a transition
+  sent_blocked = 0
+  sent_transitions = 0
   for i, msg in enumerate(rec.msgs):
     which = msg.which()
     if which not in ('can', 'sendcan') or not _judged_engaged(rec, i):
@@ -443,36 +445,49 @@ def _blocked_while_engaged(rec: Recording, mode: int, param: int, safety, why_no
       continue
     for k, frame in enumerate(msg.can):
       decision = decisions.get((i, k))
-      if frame.src - ECHO_BASE in range(BUSES):
-        oracle_only += decision is not None and not decision.allowed
-        continue
-      bus = frame.src - BLOCKED
-      if bus not in range(BUSES):
-        continue
-      blocked += 1
+      sent = frame.src - ECHO_BASE in range(BUSES)
+      if sent:
+        if decision is None or decision.allowed:
+          continue
+        bus = frame.src - ECHO_BASE
+        sent_blocked += 1
+      else:
+        bus = frame.src - BLOCKED
+        if bus not in range(BUSES):
+          continue
+        blocked += 1
       if decision is not None and not decision.allowed and decision.since_change <= TRANSITION * DT:
-        transitions += 1
+        if sent:
+          sent_transitions += 1
+        else:
+          transitions += 1
         continue
-      key = (rec.span_at(i), frame.address, bus)
+      key = (rec.span_at(i), frame.address, bus, sent)
       if key in reported:
         continue
       reported.add(key)
       t = rec.t(i)
-      if safety is None:
-        reason = "not replayed through libsafety"
-      elif decision is None:
-        reason = "libsafety has no decision on it"
-      elif decision.allowed:
-        reason = "libsafety allows it"
+      if sent:
+        line = f"t={t:.2f} sent while engaged, addr {frame.address:#x} bus {bus}, libsafety blocks it, not at a transition"
       else:
-        reason = "libsafety blocks it too, not at a transition"
-      failures.append((t, f"t={t:.2f} blocked while engaged, addr {frame.address:#x} bus {bus}, {reason}"))
+        if safety is None:
+          reason = "not replayed through libsafety"
+        elif decision is None:
+          reason = "libsafety has no decision on it"
+        elif decision.allowed:
+          reason = "libsafety allows it"
+        else:
+          reason = "libsafety blocks it too, not at a transition"
+        line = f"t={t:.2f} blocked while engaged, addr {frame.address:#x} bus {bus}, {reason}"
+      failures.append((t, line))
       notes += [f"t={t:.2f} {line}" for line in block_context(rec, i, frame, decision, dbcs)]
   evidence = f"{commands} commands while engaged, {blocked} blocked by the panda"
   if safety is None:
     evidence += f", not replayed through libsafety, {why_not}" if why_not else ""
   else:
-    evidence += f", {transitions} of them at a transition libsafety blocks too, {oracle_only} sent that libsafety blocks"
+    evidence += f", {transitions} of them at a transition libsafety blocks too, {sent_blocked} sent that libsafety blocks"
+    if sent_blocked:
+      evidence += f", {sent_transitions} of them at a transition"
   return Check(evidence, failures, notes)
 
 

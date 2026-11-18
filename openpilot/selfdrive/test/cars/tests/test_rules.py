@@ -146,20 +146,20 @@ class TestRules(unittest.TestCase):
     assert "    t=3.05 frame: 0000000000000000 (no DBC describes it)" in blocked.lines()
 
   def test_block_at_transition(self):
-    # the gas press reaches the panda in the cycle before the block, openpilot's command is from before it
+    # the gas press reaches the panda in the cycle before the block, openpilot's command is from before it, after the drive's commands
     msgs = clean_drive()
-    msgs.append(can_msg('can', 3.05, [(GAS, 0)]))
-    msgs += blocked_command(3.05 + (TRANSITION - 1) * 0.01)
+    msgs.append(can_msg('can', 6.5, [(GAS, 0)]))
+    msgs += blocked_command(6.5 + (TRANSITION - 1) * 0.01)
     assert oracle_failures(msgs, FakeSafety()) == []
     blocked = rule_checks(msgs, TOYOTA, 0, 0, safety=FakeSafety())[1]
     assert "1 of them at a transition libsafety blocks too" in blocked.evidence
 
   def test_block_long_after_transition(self):
     msgs = clean_drive()
-    msgs.append(can_msg('can', 3.05, [(GAS, 0)]))
-    msgs += blocked_command(3.05 + (TRANSITION + 1) * 0.01)
+    msgs.append(can_msg('can', 6.5, [(GAS, 0)]))
+    msgs += blocked_command(6.5 + (TRANSITION + 1) * 0.01)
     result = oracle_failures(msgs, FakeSafety())
-    assert result == ["t=3.09 blocked while engaged, addr 0x100 bus 0, libsafety blocks it too, not at a transition"]
+    assert result == ["t=6.54 blocked while engaged, addr 0x100 bus 0, libsafety blocks it too, not at a transition"]
 
   def test_block_libsafety_allows(self):
     msgs = clean_drive()
@@ -172,8 +172,18 @@ class TestRules(unittest.TestCase):
   def test_sent_libsafety_blocks(self):
     msgs = clean_drive()
     blocked = rule_checks(msgs, TOYOTA, 0, 0, safety=FakeSafety(blocks_all=True))[1]
+    assert [line for _, line in blocked.failures] == ["t=2.01 sent while engaged, addr 0x100 bus 0, libsafety blocks it, not at a transition"]
+    assert blocked.evidence.endswith("5 sent that libsafety blocks, 0 of them at a transition")
+    assert any("libsafety blocks it: controls_allowed 0" in note for note in blocked.notes)
+
+  def test_sent_at_transition(self):
+    # the gas press reached the panda right after it took the command, its echo came after the press
+    msgs = clean_drive()
+    msgs.append(can_msg('sendcan', 6.5, [(0x100, 0)]))
+    msgs.append(can_msg('can', 6.505, [(GAS, 0), (0x100, 128)]))
+    blocked = rule_checks(msgs, TOYOTA, 0, 0, safety=FakeSafety())[1]
     assert blocked.failures == []
-    assert blocked.evidence.endswith("5 sent that libsafety blocks")
+    assert blocked.evidence.endswith("1 sent that libsafety blocks, 1 of them at a transition")
 
   def test_tx_in_echo_order(self):
     # the panda queues its echo of a command with the rx as it takes it, after the drive's commands
@@ -182,7 +192,7 @@ class TestRules(unittest.TestCase):
       msgs.append(can_msg('sendcan', 6.5, [(0x100, 0)]))
       msgs.append(can_msg('can', 6.505, frames))
       check = rule_checks(msgs, TOYOTA, 0, 0, safety=FakeSafety())[1]
-      assert check.evidence.endswith(f"{blocked} sent that libsafety blocks")
+      assert f"{blocked} sent that libsafety blocks" in check.evidence
 
   def test_forwarded_echo(self):
     # the panda's echo of a frame it forwards isn't a command, though openpilot sends the same message
