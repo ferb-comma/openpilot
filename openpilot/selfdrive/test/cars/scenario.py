@@ -17,15 +17,18 @@ from opendbc.car.tests.test_models import COMMA_API_URL, TestCarModelBase, get_c
 from opendbc.car.vin import VIN_UNKNOWN
 from opendbc.safety.tests.libsafety import libsafety_py
 
+from openpilot.selfdrive.test.cars.rules import ENGAGE_LIMIT
 from openpilot.tools.lib.logreader import LogReader
 
 LEAD = 5.
-# the engaged stretch the rules judge after the edge, the engage limit and a run of commands
-MIN_ENGAGED = 10.
+# the engaged stretch after the edge the rules judge: the engage limit and then 3 s of commands to check for blocks,
+# stops and drops, the window takes up to MAX_ENGAGED of a longer one
+MIN_ENGAGED = ENGAGE_LIMIT + 3.
+MAX_ENGAGED = 10.
 # slack after the recording so it ends before the loop wraps
 TAIL = 1.
 # the UP loops the window, so a short one keeps the wait for its next start short
-LENGTH = LEAD + MIN_ENGAGED + TAIL
+MIN_LENGTH = LEAD + MIN_ENGAGED + TAIL
 # other segments of a route searched for a window when its opendbc segment has none
 SEARCH_SEGMENTS = 10
 SCENARIOS = Path(__file__).parent / "scenarios.json"
@@ -138,17 +141,16 @@ def pick_window(samples: list[tuple[float, bool]], can_end: float, lead_in: bool
       seen_down = True
     last = i == len(samples) - 1
     if rise is not None and (not allowed or last):
-      length = (can_end if allowed else t) - rise
+      engaged = min((can_end if allowed else t) - rise, MAX_ENGAGED, can_end - TAIL - rise)
       start = rise - LEAD
-      fits = length >= MIN_ENGAGED and start + LENGTH <= can_end
       led_in = start >= 0. and allowed_before_rise < start
-      if fits and (led_in or not lead_in) and length > best_len:
-        best, best_len = (start, rise), length
+      if engaged >= MIN_ENGAGED and (led_in or not lead_in) and engaged > best_len:
+        best, best_len = (start, rise), engaged
       rise = None
   if best is None:
     return None
   start, rise = best
-  return Window(start, start + LENGTH), rise
+  return Window(start, rise + best_len + TAIL), rise
 
 
 def safety_pair(CP: structs.CarParams) -> tuple[int, int]:
@@ -280,7 +282,7 @@ def segment_data(route: CarTestRoute, segment: int) -> RouteData:
 def usable(data: RouteData) -> tuple[Window, float, int] | None:
   # the segment's window, its engage edge and command cadence, None if the DUT can't drive one from it
   _, _, dut_gap, _, span, samples, sendcan = data
-  if dut_gap or span < LENGTH:
+  if dut_gap or span < MIN_LENGTH:
     return None
   picked = pick_window(samples, span)
   if picked is None:
@@ -340,14 +342,14 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
         if first:
           gaps.append(f"{who}: can't load ({result})")
         continue
-      if first and all(data[4] < LENGTH for data in result):
-        gaps.append(f"{who}: segment shorter than {LENGTH:g} s")
+      if first and all(data[4] < MIN_LENGTH for data in result):
+        gaps.append(f"{who}: segment shorter than {MIN_LENGTH:g} s")
       for data in result:
         add_segment(route, data)
 
   def add_segment(route: CarTestRoute, data: RouteData) -> None:
     segment, mode_param, dut_gap, alpha_long, span, samples, sendcan = data
-    if span < LENGTH:
+    if span < MIN_LENGTH:
       return
     try:
       checks = rx_checks(*mode_param)

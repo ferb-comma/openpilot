@@ -12,12 +12,10 @@ from openpilot.common.params import Params
 from openpilot.selfdrive.test.helpers import set_params_enabled
 from openpilot.selfdrive.test.cars.replay import DT, Frame, Replay
 from openpilot.selfdrive.test.cars.rules import NO_CAR_MODES, is_event, log_line
-from openpilot.selfdrive.test.cars.scenario import MIN_ENGAGED, Scenario
+from openpilot.selfdrive.test.cars.scenario import TAIL, Scenario
 
 # seconds from manager start, ~2x the measured normal onroad time (20-25 s)
 ONROAD_LIMIT = 45.
-# long enough for ENGAGE_LIMIT plus a stretch of engaged commands
-ENGAGED_RECORD = MIN_ENGAGED
 # subscribed this long before the recording window, so the states before its start are known
 PREROLL = 0.5
 RECORD = ('can', 'sendcan', 'pandaStates', 'selfdriveState', 'carState', 'onroadEvents', 'managerState')
@@ -257,7 +255,8 @@ class Drive:
       for sock in socks:
         messaging.drain_sock_raw(sock)
       self.timing['wait for loop'] = start - onroad
-      end = start + (scenario.rise - scenario.window.start) + ENGAGED_RECORD
+      # through the window's engaged stretch, ending TAIL before the loop wraps
+      end = start + (scenario.window.end - TAIL - scenario.window.start)
       msgs = self._record(socks, end, error_sock, errors)
       self.timing['record'] = time.monotonic() - start
       return DriveLog(msgs + errors, int(start * 1e9))
