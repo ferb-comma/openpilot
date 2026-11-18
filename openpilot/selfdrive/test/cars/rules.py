@@ -9,6 +9,7 @@ from opendbc.can.dbc import DBC, Msg, SignalType
 from opendbc.car.structs import CarParams
 from opendbc.car.values import PLATFORMS
 from opendbc.safety.tests.libsafety import libsafety_py
+from panda import FW_PATH
 
 # seconds after the panda's engage edge by which openpilot must be enabled
 ENGAGE_LIMIT = 2.
@@ -266,17 +267,28 @@ def _not_engaged(rec: Recording) -> Check:
   return Check("; ".join(evidence), failures)
 
 
+def panda_release() -> bool:
+  # the panda's firmware is a release build, which leaves out the debug safety modes and flags (ALLOW_DEBUG)
+  with open(os.path.join(FW_PATH, "version")) as f:
+    return f.read().strip().endswith("-RELEASE")
+
+
 def load_libsafety():
-  # libsafety to replay a recording through, and why there is none. a device has no UBSan runtime for the default build,
-  # so there it builds without the sanitizer
+  # libsafety built like the panda's firmware to replay a recording through, and why there is none. a device has no UBSan
+  # runtime for the default build, so there it builds without the sanitizer, libsafety_py's debug build without it has coverage
   try:
-    return libsafety_py.libsafety, ""
-  except Exception:
-    pass
+    release = panda_release()
+  except OSError as e:
+    return None, f"no panda firmware build to match: {e!r}"
+  if not release:
+    try:
+      return libsafety_py.libsafety, ""
+    except Exception:
+      pass
   coverage = os.environ.get("SAFETY_COVERAGE")
   os.environ["SAFETY_COVERAGE"] = "1"
   try:
-    libsafety_py.load(libsafety_py._build_libsafety(release=True))
+    libsafety_py.load(libsafety_py._build_libsafety(release=release))
     return libsafety_py.libsafety, ""
   except Exception as e:
     return None, f"libsafety doesn't build here: {e!r}"
