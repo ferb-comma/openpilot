@@ -46,21 +46,67 @@ run = "openpilot/tools/replay/can_replay.py --up && ./openpilot/selfdrive/test/t
 timeout-minutes = 1.5
 
 # every car's engaged route window from scenarios.json end to end, the UP plays the car. the route logs live in the cache
-[jobs.cars]
-runs-on = "up-mici"
-timeout-minutes = 60
-# each shard drives every 5th car, see ALFRED_SHARD in test_cars.py
-shards = 5
-# every master commit, a PR only when it changes the test
-paths = ["openpilot/selfdrive/test/cars/**", "openpilot/selfdrive/test/test_cars.py"]
-env = { COMMA_CACHE = "/data/scons_cache/cars_routes" }
-
-[[jobs.cars.steps]]
-uses = "build"
-
-[[jobs.cars.steps]]
+[steps.cars]
 name = "Cars"
 run = "./openpilot/selfdrive/test/test_cars.py"
+
+# every car, split over 8 stations, the most alfred's 20 job limit leaves: each job drives every 8th car (ALFRED_SHARD, see test_cars.py)
+# every master commit, a PR only when it changes the test
+[jobs.cars]
+runs-on = "up-mici"
+timeout-minutes = 30
+paths = ["openpilot/selfdrive/test/cars/**", "openpilot/selfdrive/test/test_cars.py"]
+env = { COMMA_CACHE = "/data/scons_cache/cars_routes", ALFRED_SHARD = "0", ALFRED_SHARDS = "8" }
+steps = [{ uses = "build" }, { uses = "cars" }]
+
+[jobs.cars1]
+runs-on = "up-mici"
+timeout-minutes = 30
+paths = ["openpilot/selfdrive/test/cars/**", "openpilot/selfdrive/test/test_cars.py"]
+env = { COMMA_CACHE = "/data/scons_cache/cars_routes", ALFRED_SHARD = "1", ALFRED_SHARDS = "8" }
+steps = [{ uses = "build" }, { uses = "cars" }]
+
+[jobs.cars2]
+runs-on = "up-mici"
+timeout-minutes = 30
+paths = ["openpilot/selfdrive/test/cars/**", "openpilot/selfdrive/test/test_cars.py"]
+env = { COMMA_CACHE = "/data/scons_cache/cars_routes", ALFRED_SHARD = "2", ALFRED_SHARDS = "8" }
+steps = [{ uses = "build" }, { uses = "cars" }]
+
+[jobs.cars3]
+runs-on = "up-mici"
+timeout-minutes = 30
+paths = ["openpilot/selfdrive/test/cars/**", "openpilot/selfdrive/test/test_cars.py"]
+env = { COMMA_CACHE = "/data/scons_cache/cars_routes", ALFRED_SHARD = "3", ALFRED_SHARDS = "8" }
+steps = [{ uses = "build" }, { uses = "cars" }]
+
+[jobs.cars4]
+runs-on = "up-mici"
+timeout-minutes = 30
+paths = ["openpilot/selfdrive/test/cars/**", "openpilot/selfdrive/test/test_cars.py"]
+env = { COMMA_CACHE = "/data/scons_cache/cars_routes", ALFRED_SHARD = "4", ALFRED_SHARDS = "8" }
+steps = [{ uses = "build" }, { uses = "cars" }]
+
+[jobs.cars5]
+runs-on = "up-mici"
+timeout-minutes = 30
+paths = ["openpilot/selfdrive/test/cars/**", "openpilot/selfdrive/test/test_cars.py"]
+env = { COMMA_CACHE = "/data/scons_cache/cars_routes", ALFRED_SHARD = "5", ALFRED_SHARDS = "8" }
+steps = [{ uses = "build" }, { uses = "cars" }]
+
+[jobs.cars6]
+runs-on = "up-mici"
+timeout-minutes = 30
+paths = ["openpilot/selfdrive/test/cars/**", "openpilot/selfdrive/test/test_cars.py"]
+env = { COMMA_CACHE = "/data/scons_cache/cars_routes", ALFRED_SHARD = "6", ALFRED_SHARDS = "8" }
+steps = [{ uses = "build" }, { uses = "cars" }]
+
+[jobs.cars7]
+runs-on = "up-mici"
+timeout-minutes = 30
+paths = ["openpilot/selfdrive/test/cars/**", "openpilot/selfdrive/test/test_cars.py"]
+env = { COMMA_CACHE = "/data/scons_cache/cars_routes", ALFRED_SHARD = "7", ALFRED_SHARDS = "8" }
+steps = [{ uses = "build" }, { uses = "cars" }]
 
 [jobs.hardware]
 runs-on = "up-mici"
