@@ -18,6 +18,8 @@ from openpilot.selfdrive.test.cars.scenario import TAIL, Scenario
 ONROAD_LIMIT = 45.
 # subscribed this long before the recording window, so the states before its start are known
 PREROLL = 0.5
+# the DUT's cameras, selfdrived doesn't engage while one isn't streaming
+CAMERAS = ('roadCameraState', 'driverCameraState')
 RECORD = ('can', 'sendcan', 'pandaStates', 'selfdriveState', 'carState', 'carControl', 'onroadEvents', 'managerState')
 # the panda marks its own tx echoes with src + 128
 ECHO = 128
@@ -43,6 +45,9 @@ def onroad_missing(sm) -> list[str]:
   missing = []
   if not sm['deviceState'].started:
     missing.append("not started")
+  for camera in CAMERAS:
+    if not sm.alive[camera]:
+      missing.append(f"camera not streaming: no {camera}")
   if not sm['carState'].canValid:
     missing.append("carState not canValid")
   stopped = [p.name for p in sm['managerState'].processes if p.shouldBeRunning and not p.running]
@@ -202,6 +207,9 @@ class Drive:
         error = card_error or last_error
         if error:
           missing.append(f"last error {error}")
+        cameras = [m for m in missing if m.startswith("camera")]
+        if cameras:
+          raise RigProblem(f"rig problem: {', '.join(cameras)}")
         raise DriveFailed(f"not onroad {ONROAD_LIMIT:g} s after manager start: {', '.join(missing)}")
 
   def _wait(self, until: float, error_sock, errors: list) -> None:
@@ -230,7 +238,7 @@ class Drive:
     self.slowest_exits = []
     frames = replay.frames
     buses = {bus for frame in frames for _, _, bus in frame}
-    sm = messaging.SubMaster(['deviceState', 'carState', 'managerState', 'pandaStates', 'onroadEvents'])
+    sm = messaging.SubMaster(['deviceState', 'carState', 'managerState', 'pandaStates', 'onroadEvents', *CAMERAS])
     can_sock = messaging.sub_sock('can', conflate=False)
     # every error since openpilot started, not just the recording window's
     error_sock = messaging.sub_sock('errorLogMessage', conflate=False)

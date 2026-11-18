@@ -140,6 +140,8 @@ def _panda_states(rec: Recording):
 
 
 BLOCKING_FLAGS = ('noEntry', 'softDisable', 'immediateDisable', 'userDisable')
+# events of the DUT's own hardware, not the car's: a camera not streaming
+RIG_EVENTS = ('cameraMalfunction', 'cameraFrameRate')
 
 
 def log_record(text: str) -> dict:
@@ -685,6 +687,16 @@ def failure_lines(checks: list[Check]) -> list[str]:
 
 def rule_failures(msgs: list, mode: int, param: int, max_idle: int, start: int | None = None, safety=None, why_not: str = "") -> list[str]:
   return failure_lines(rule_checks(msgs, mode, param, max_idle, start, safety, why_not))
+
+
+def rig_problem(msgs: list, start: int | None = None) -> str:
+  # the DUT's own hardware events in the recording window, a rig problem rather than the car's, empty if none
+  rec = _load(msgs, start)
+  names = set()
+  for i, msg in enumerate(rec.msgs):
+    if msg.which() == 'onroadEvents' and rec.t(i) >= 0.:
+      names |= {str(event.name) for event in msg.onroadEvents if str(event.name) in RIG_EVENTS}
+  return f"rig problem: {', '.join(sorted(names))}, a DUT camera not streaming" if names else ""
 
 
 def cadence(msgs: list, start: int | None = None) -> str:

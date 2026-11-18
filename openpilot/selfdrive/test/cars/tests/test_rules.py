@@ -4,7 +4,7 @@ import unittest
 from opendbc.car.structs import CarParams
 
 from openpilot.cereal.messaging import new_message
-from openpilot.selfdrive.test.cars.rules import (SAFETY_STATE, TRANSITION, _tx_timing, cadence, is_event, log_line, rule_checks,
+from openpilot.selfdrive.test.cars.rules import (SAFETY_STATE, TRANSITION, _tx_timing, cadence, is_event, log_line, rig_problem, rule_checks,
                                                  rule_failures)
 
 TOYOTA = int(CarParams.SafetyModel.toyota)
@@ -367,6 +367,13 @@ class TestTxTiming(unittest.TestCase):
     # the echoes come 10 ms after card's sendcan, a second apart
     assert cadence(clean_drive(4.)) == "longest gaps while engaged: sendcan 1000 ms, TX echoes 1000 ms"
 
+
+
+class TestRigProblem(unittest.TestCase):
+  def test_camera_not_streaming(self):
+    msgs = clean_drive() + [onroad_events(1.2, 'cameraMalfunction', noEntry=True)]
+    assert rig_problem(msgs) == "rig problem: cameraMalfunction, a DUT camera not streaming"
+    assert rig_problem(clean_drive() + [onroad_events(1.2, 'pedalPressed', noEntry=True)]) == ""
 
 
 if __name__ == "__main__":

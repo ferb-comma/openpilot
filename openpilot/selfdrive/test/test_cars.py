@@ -14,7 +14,7 @@ from openpilot.common.basedir import BASEDIR
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.test.cars.drive import Drive, DriveFailed, RigProblem
 from openpilot.selfdrive.test.cars.replay import BUDGET, Replay, scenario_replay
-from openpilot.selfdrive.test.cars.rules import (SAFETY_MODELS, Check, cadence, failure_lines, fingerprinted, load_libsafety, rule_checks,
+from openpilot.selfdrive.test.cars.rules import (SAFETY_MODELS, Check, cadence, failure_lines, fingerprinted, load_libsafety, rig_problem, rule_checks,
                                                  summary)
 from openpilot.selfdrive.test.cars.scenario import DASHCAM_ONLY, Scenario, load_scenarios
 
@@ -95,6 +95,8 @@ class DriveResult:
   def line(self) -> str:
     if self.status == "passed":
       return f"✅ {self.name}  {self.stats}  {self.times}"
+    if self.status == RIG_PROBLEM:
+      return f"⚠ {self.name}  {self.first_failure}  {self.times}"
     return f"❌ {self.name}  {self.first_failure}  {self.times}"
 
   def details(self) -> list[str]:
@@ -196,8 +198,10 @@ class TestCars(OpenpilotTestCase):
 
     passed = sum(r.status == "passed" for r in cls.results)
     not_driven = sum(r.status == NOT_DRIVEN for r in cls.results)
-    failed = len(cls.results) - passed - not_driven
-    rig = f", {not_driven} not driven after a rig problem" if not_driven else ""
+    rig_problems = sum(r.status == RIG_PROBLEM for r in cls.results)
+    failed = len(cls.results) - passed - not_driven - rig_problems
+    rig = f", {rig_problems} rig problem" if rig_problems else ""
+    rig += f", {not_driven} not driven after a rig problem" if not_driven else ""
     cls.summary = f"{cls.job}: {passed} passed, {failed} failed{rig}, {(time.monotonic() - start) / 60:.1f} min"
 
   @staticmethod
@@ -215,6 +219,11 @@ class TestCars(OpenpilotTestCase):
       result.fingerprinted = fingerprinted(log.msgs)
       result.cadence = cadence(log.msgs, start=log.start)
       result.status = "passed" if not result.failures else "failed"
+      # the car's failures don't count when the DUT's own hardware failed under it
+      rig = rig_problem(log.msgs, start=log.start)
+      if result.failures and rig:
+        result.status = RIG_PROBLEM
+        result.error = rig
     except RigProblem as e:
       result.status = RIG_PROBLEM
       result.error = str(e)
