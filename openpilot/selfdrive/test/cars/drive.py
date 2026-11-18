@@ -77,13 +77,6 @@ class Drive:
   def log_path(self, scenario: Scenario) -> str:
     return os.path.join(self.log_dir, f"{scenario.car_model}_{scenario.mode}_{scenario.param}.log")
 
-  def log_tail(self, scenario: Scenario, lines: int = 15) -> list[str]:
-    try:
-      with open(self.log_path(scenario), errors="replace") as f:
-        return f.read().splitlines()[-lines:]
-    except OSError:
-      return []
-
   def _start_manager(self, scenario: Scenario) -> None:
     set_params_enabled()
     # calibrationd drops the seeded calibration when the previous route was another car, so no previous car

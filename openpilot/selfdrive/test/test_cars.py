@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import subprocess
 import tempfile
 import time
 import unittest
@@ -7,6 +8,7 @@ from dataclasses import dataclass
 
 from opendbc.car.structs import CarParams
 
+from openpilot.common.basedir import BASEDIR
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.test.cars.drive import Drive, DriveFailed, RigProblem
 from openpilot.selfdrive.test.cars.replay import BUDGET, build_replay
@@ -18,9 +20,15 @@ RIG_PROBLEM = "rig problem"
 SAFETY_MODELS = {v: k for k, v in CarParams.SafetyModel.schema.enumerants.items()}
 
 
+def commit() -> str:
+  return os.getenv("GIT_COMMIT") or subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=BASEDIR, encoding="utf-8").strip()
+
+
 @dataclass
 class DriveResult:
   scenario: Scenario
+  # the car model alone does not pick this scenario out
+  shared_model: bool = False
   status: str = NOT_DRIVEN
   error: str = ""
   failures: list[str] | None = None
@@ -38,6 +46,12 @@ class DriveResult:
       return self.error.splitlines()[0]
     return self.failures[0] if self.failures else ""
 
+  @property
+  def repeat(self) -> str:
+    s = self.scenario
+    selector = f"{s.car_model}:{s.param}" if self.shared_model else s.car_model
+    return f"repeat: SCENARIOS={selector} ./openpilot/selfdrive/test/test_cars.py   (commit {commit()})"
+
   def line(self) -> str:
     if self.status == "passed":
       return f"✅ {self.name}  {self.stats}  {self.took:.0f} s"
@@ -46,7 +60,7 @@ class DriveResult:
 
 # every car's engaged route window on a DUT in an ultimate provisioning (UP) station, the UP plays the car.
 # setup_class drives each scenario in scenarios.json once and records it, the tests check the recordings.
-# SCENARIOS=TOYOTA_COROLLA_TSS2,HONDA_CIVIC only drives those car models
+# SCENARIOS=TOYOTA_COROLLA_TSS2,HONDA_CIVIC only drives those car models, HONDA_HRV_3G:8 one param of a car model
 class TestCars(OpenpilotTestCase):
   COMMA_HARDWARE_TEST = True
 
@@ -62,11 +76,12 @@ class TestCars(OpenpilotTestCase):
     for gap in gaps:
       print(f"  {gap}", flush=True)
     models = [m.strip() for m in os.getenv("SCENARIOS", "").split(",") if m.strip()]
-    cls.unmatched = [m for m in models if not any(s.car_model == m for s in scenarios)]
+    cls.unmatched = [m for m in models if not any(m in (s.car_model, f"{s.car_model}:{s.param}") for s in scenarios)]
+    car_models = [s.car_model for s in scenarios]
     if models:
-      scenarios = [s for s in scenarios if s.car_model in models]
+      scenarios = [s for s in scenarios if s.car_model in models or f"{s.car_model}:{s.param}" in models]
 
-    cls.results = [DriveResult(s) for s in scenarios]
+    cls.results = [DriveResult(s, shared_model=car_models.count(s.car_model) > 1) for s in scenarios]
     log_dir = tempfile.mkdtemp(prefix="test_cars_")
     print(f"manager logs in {log_dir}", flush=True)
     drive = Drive(UP.remote(), log_dir)
@@ -76,8 +91,7 @@ class TestCars(OpenpilotTestCase):
         cls.drive_one(drive, result)
         print(result.line(), flush=True)
         if result.status == "failed":
-          for line in drive.log_tail(result.scenario):
-            print(f"    {line}", flush=True)
+          print(f"    {result.repeat}", flush=True)
         if result.status == RIG_PROBLEM:
           break
     finally:
@@ -135,5 +149,7 @@ if __name__ == "__main__":
   program = unittest.main(exit=False)
   for result in getattr(TestCars, "results", []):
     print(result.line())
+    if result.status != "passed":
+      print(f"    {result.repeat}")
   print(getattr(TestCars, "summary", ""), flush=True)
   raise SystemExit(not program.result.wasSuccessful())
