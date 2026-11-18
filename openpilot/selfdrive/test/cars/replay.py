@@ -4,13 +4,13 @@ from collections.abc import Iterable
 
 from opendbc.can.dbc import DBC, Msg, SignalType
 from opendbc.can.packer import CANPacker
-from opendbc.car import structs
+from opendbc.car import gen_empty_fingerprint, structs
 from opendbc.car.can_definitions import CanData
 from opendbc.car.car_helpers import interfaces
 
 from openpilot.selfdrive.pandad import can_capnp_to_list
 from openpilot.selfdrive.test.cars.rules import BUSES
-from openpilot.selfdrive.test.cars.scenario import Scenario, Window, build_candidates, load_scenario
+from openpilot.selfdrive.test.cars.scenario import Fingerprint, Scenario, Window, build_candidates, dut_params, load_scenario, safety_pair
 
 # the UP's can_replay frame period
 DT = 0.01
@@ -222,6 +222,67 @@ def radar_problems(CP: structs.CarParams, window: list[Frame], replay: list[Fram
   return problems
 
 
+def _differs(car_model: str, CP: structs.CarParams, fingerprint: Fingerprint) -> list[str]:
+  # the car params fields the DUT derives differently from this fingerprint
+  dut = dut_params(car_model, fingerprint).to_dict()
+  return sorted(k for k, v in CP.to_dict().items() if dut.get(k) != v)
+
+
+def _can_valid(CP: structs.CarParams, frames: list[Frame]) -> bool:
+  # carState is canValid throughout the second of two loops, as the UP plays it
+  car = interfaces[CP.carFingerprint](CP)
+  packets = _packets(frames)
+  loop = round(len(frames) * DT * 1e9)
+  for t, packet in packets:
+    car.update([(t, packet)])
+  return all(car.update([(t + loop, packet)]).canValid for t, packet in packets)
+
+
+def _dut_problem(car_model: str, CP: structs.CarParams, fingerprint: Fingerprint, replay: list[Frame]) -> str | None:
+  # what keeps the DUT, deriving its car params from this fingerprint, from driving the replay built for CP
+  dut = dut_params(car_model, fingerprint)
+  if safety_pair(dut) != safety_pair(CP):
+    return f"safety pair {safety_pair(dut)} != {safety_pair(CP)}"
+  if dut.dashcamOnly:
+    return "dashcam only"
+  if not _can_valid(dut, replay):
+    return "carState not canValid"
+  return None
+
+
+def fingerprint_problems(car_model: str, CP: structs.CarParams, fingerprint: Fingerprint, replay: list[Frame]) -> list[str]:
+  # card derives its car params from the fingerprint the replay presents, not the route's
+  presented = gen_empty_fingerprint()
+  for frame in replay:
+    for addr, dat, bus in frame:
+      presented[bus][addr] = len(dat)
+  problem = _dut_problem(car_model, CP, presented, replay)
+  if problem is None:
+    return []
+  differ = _differs(car_model, CP, presented)
+  # add the route's messages the replay drops back until the car params match, then take back the ones not needed
+  dropped = sorted((bus, addr) for bus, addrs in fingerprint.items() for addr, size in addrs.items() if presented[bus].get(addr) != size)
+  restored = {bus: dict(addrs) for bus, addrs in presented.items()}
+  added = []
+  for bus, addr in dropped:
+    restored[bus][addr] = fingerprint[bus][addr]
+    added.append((bus, addr))
+    if not _differs(car_model, CP, restored):
+      break
+  else:
+    return [f"{problem} on the replay's fingerprint, car params differ: {', '.join(differ)}"]
+  for bus, addr in list(added):
+    size = restored[bus].pop(addr)
+    if addr in presented[bus]:
+      restored[bus][addr] = presented[bus][addr]
+    if _differs(car_model, CP, restored):
+      restored[bus][addr] = size
+    else:
+      added.remove((bus, addr))
+  needs = ', '.join(f"{addr:#x} bus {bus}" for bus, addr in added)
+  return [f"{problem} on the replay's fingerprint, needs messages the replay drops: {needs} ({', '.join(differ)})"]
+
+
 def build_replay(s: Scenario, CP: structs.CarParams, msgs: list, budget: dict[int, float]) -> list[Frame]:
   # what a station sends, one frame per DT
   needed = needed_frames(CP, s.rx_checks, window_frames(msgs, s.window))
@@ -231,17 +292,18 @@ def build_replay(s: Scenario, CP: structs.CarParams, msgs: list, budget: dict[in
 def scenario_replay(s: Scenario) -> list[Frame]:
   # a scenario's replay from its route, built in a worker while the previous car drives
   try:
-    CP, msgs = load_scenario(s)
+    CP, _, msgs = load_scenario(s)
     return build_replay(s, CP, msgs, BUDGET)
   except Exception as e:
     # the worker pickles exceptions back, and not every exception pickles
     raise RuntimeError(repr(e)) from None
 
 
-def replay_problems(s: Scenario, CP: structs.CarParams, msgs: list, budget: dict[int, float]) -> list[str]:
+def replay_problems(s: Scenario, CP: structs.CarParams, fingerprint: Fingerprint, msgs: list, budget: dict[int, float]) -> list[str]:
   # what keeps a scenario's replay from playing its car on a station
   replay = build_replay(s, CP, msgs, budget)
-  problems = [f"lane budget: {p}" for p in over_budget(replay, budget)]
+  problems = fingerprint_problems(s.car_model, CP, fingerprint, replay)
+  problems += [f"lane budget: {p}" for p in over_budget(replay, budget)]
   problems += radar_problems(CP, window_frames(msgs, s.window), replay)
   return problems
 
@@ -249,8 +311,8 @@ def replay_problems(s: Scenario, CP: structs.CarParams, msgs: list, budget: dict
 def pick_replay(candidates: list[Scenario], budget: dict[int, float]) -> tuple[Scenario, list[str]]:
   # a pair's scenarios in routes order, the first whose replay plays on a station, or else the last
   for s in candidates:
-    CP, msgs = load_scenario(s)
-    problems = replay_problems(s, CP, msgs, budget)
+    CP, fingerprint, msgs = load_scenario(s)
+    problems = replay_problems(s, CP, fingerprint, msgs, budget)
     if not problems:
       break
   return s, problems

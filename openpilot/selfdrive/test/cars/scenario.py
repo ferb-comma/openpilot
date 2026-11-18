@@ -157,14 +157,20 @@ def rx_checks(mode: int, param: int) -> dict[tuple[int, int], bool]:
   return checks
 
 
-def car_params(car_model: str, path: Path) -> tuple[structs.CarParams, structs.CarParams]:
-  # the route's car params, and the DUT's: SKIP_FW_QUERY leaves no firmware and the alpha long toggle is unset
+Fingerprint = dict[int, dict[int, int]]
+
+
+def dut_params(car_model: str, fingerprint: Fingerprint) -> structs.CarParams:
+  # SKIP_FW_QUERY leaves no firmware and the alpha long toggle is unset
+  return interfaces[car_model].get_params(car_model, fingerprint, [], False, False, docs=False)
+
+
+def car_params(car_model: str, path: Path) -> tuple[structs.CarParams, structs.CarParams, Fingerprint]:
+  # the route's car params, the DUT's on the route's fingerprint, and the fingerprint
   cls = type("R", (TestCarModelBase,), {"platform": car_model})
   car_fw, _, alpha_long = cls.get_testing_data_from_logreader(OpendbcLogReader(str(path), only_union_types=True, sort_by_time=True))
-  get_params = interfaces[cls.platform].get_params
-  route_CP = get_params(cls.platform, cls.fingerprint, car_fw, alpha_long, False, docs=False)
-  dut_CP = get_params(cls.platform, cls.fingerprint, [], False, False, docs=False)
-  return route_CP, dut_CP
+  route_CP = interfaces[cls.platform].get_params(cls.platform, cls.fingerprint, car_fw, alpha_long, False, docs=False)
+  return route_CP, dut_params(cls.platform, cls.fingerprint), cls.fingerprint
 
 
 def read_log(path: Path) -> list:
@@ -172,13 +178,14 @@ def read_log(path: Path) -> list:
   return sorted(LogReader.from_bytes(path.read_bytes()), key=lambda m: m.logMonoTime)
 
 
-def load_scenario(s: Scenario) -> tuple[structs.CarParams, list]:
-  # the scenario's log and the car params thinning repacks with, one route's worth of work
+def load_scenario(s: Scenario) -> tuple[structs.CarParams, Fingerprint, list]:
+  # the DUT's car params on the route's fingerprint, which the replay is built for, the fingerprint and the log
   path = get_cached_segment(s.route, s.segment)
-  return car_params(s.car_model, path)[0], read_log(path)
+  _, CP, fingerprint = car_params(s.car_model, path)
+  return CP, fingerprint, read_log(path)
 
 
-def load_route(route: CarTestRoute) -> tuple[int, tuple[structs.CarParams, structs.CarParams], list]:
+def load_route(route: CarTestRoute) -> tuple[int, tuple[structs.CarParams, structs.CarParams, Fingerprint], list]:
   segments = (2, 1, 0) if route.segment is None else (route.segment,)
   errors = []
   for segment in segments:
@@ -201,7 +208,7 @@ RouteData = tuple[int, tuple[int, int], tuple[int, int], bool, float, list[tuple
 def read_route(route: CarTestRoute) -> RouteData | Exception:
   # the picklable part of a route's load, run in a worker, a failure comes back as the exception
   try:
-    segment, (CP, dut_CP), msgs = load_route(route)
+    segment, (CP, dut_CP, _), msgs = load_route(route)
     return segment, safety_pair(CP), safety_pair(dut_CP), dut_CP.dashcamOnly, can_span(msgs), engaged_samples(msgs), sendcan_samples(msgs)
   except Exception as e:
     return e
