@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
+import multiprocessing
 import os
 import subprocess
 import tempfile
 import time
 import unittest
+from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
 
 from opendbc.car.structs import CarParams
@@ -11,9 +13,9 @@ from opendbc.car.structs import CarParams
 from openpilot.common.basedir import BASEDIR
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.test.cars.drive import Drive, DriveFailed, RigProblem
-from openpilot.selfdrive.test.cars.replay import BUDGET, build_replay
+from openpilot.selfdrive.test.cars.replay import scenario_replay
 from openpilot.selfdrive.test.cars.rules import rule_failures, summary
-from openpilot.selfdrive.test.cars.scenario import Scenario, load_scenario, load_scenarios
+from openpilot.selfdrive.test.cars.scenario import Scenario, load_scenarios
 
 NOT_DRIVEN = "not driven"
 RIG_PROBLEM = "rig problem"
@@ -94,15 +96,23 @@ class TestCars(OpenpilotTestCase):
     print(f"manager logs in {log_dir}", flush=True)
     drive = Drive(UP.remote(), log_dir)
     start = time.monotonic()
+    # builds the next car's replay while this one drives, at the lowest priority so openpilot keeps its cpu
+    pool = ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn"), initializer=os.nice, initargs=(19,))
     try:
-      for result in cls.results:
-        cls.drive_one(drive, result)
+      replays = []
+      if cls.results:
+        replays.append(pool.submit(scenario_replay, cls.results[0].scenario))
+      for i, result in enumerate(cls.results):
+        if i + 1 < len(cls.results):
+          replays.append(pool.submit(scenario_replay, cls.results[i + 1].scenario))
+        cls.drive_one(drive, result, replays[i])
         print(result.line(), flush=True)
         if result.status == "failed":
           print(f"    {result.repeat}", flush=True)
         if result.status == RIG_PROBLEM:
           break
     finally:
+      pool.shutdown(cancel_futures=True)
       drive.close()
 
     passed = sum(r.status == "passed" for r in cls.results)
@@ -113,13 +123,11 @@ class TestCars(OpenpilotTestCase):
     print(cls.summary, flush=True)
 
   @staticmethod
-  def drive_one(drive: Drive, result: DriveResult) -> None:
+  def drive_one(drive: Drive, result: DriveResult, replay: Future) -> None:
     s = result.scenario
     start = time.monotonic()
     try:
-      CP, msgs = load_scenario(s)
-      frames = build_replay(s, CP, msgs, BUDGET)
-      log = drive.run(s, frames)
+      log = drive.run(s, replay.result())
       result.onroad = log.onroad
       result.recorded = log.length
       result.failures = rule_failures(log.msgs, s.mode, s.param, start=log.start)

@@ -168,6 +168,16 @@ def build_replay(s: Scenario, CP: structs.CarParams, msgs: list, budget: dict[in
   return thin(CP, s.rx_checks, needed, budget)
 
 
+def scenario_replay(s: Scenario) -> list[Frame]:
+  # a scenario's replay from its route, built in a worker while the previous car drives
+  try:
+    CP, msgs = load_scenario(s)
+    return build_replay(s, CP, msgs, BUDGET)
+  except Exception as e:
+    # the worker pickles exceptions back, and not every exception pickles
+    raise RuntimeError(repr(e)) from None
+
+
 def pick_replay(candidates: list[Scenario], budget: dict[int, float]) -> tuple[Scenario, list[str]]:
   # a pair's scenarios in routes order, the first whose replay fits the station's lanes, or else the last
   for s in candidates:
