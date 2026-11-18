@@ -1,3 +1,4 @@
+import logging
 import math
 from collections import Counter
 from collections.abc import Iterable
@@ -55,9 +56,15 @@ def _packets(frames: list[Frame]) -> list[tuple[int, list[CanData]]]:
 
 def needed_messages(CP: structs.CarParams, rx_checks: dict[tuple[int, int], bool], frames: list[Frame]) -> set[tuple[int, int]]:
   car, radar = _parsers(CP)
-  for packet in _packets(frames):
-    car.update([packet])
-    radar.update([packet])
+  # the test's own parsers see a bus time out whenever the window has a gap, openpilot's logs stay
+  carlog = logging.getLogger("carlog")
+  level, carlog.level = carlog.level, logging.CRITICAL
+  try:
+    for packet in _packets(frames):
+      car.update([packet])
+      radar.update([packet])
+  finally:
+    carlog.setLevel(level)
   # the parsers only add the messages they read once they run
   parsers = [p for p in car.can_parsers.values() if p is not None]
   if radar.rcp is not None:

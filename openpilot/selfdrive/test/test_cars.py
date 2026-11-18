@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import multiprocessing
 import os
+import re
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
 from concurrent.futures import Future, ProcessPoolExecutor
@@ -26,6 +26,17 @@ SAFETY_MODELS = {v: k for k, v in CarParams.SafetyModel.schema.enumerants.items(
 
 def commit() -> str:
   return os.getenv("GIT_COMMIT") or subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=BASEDIR, encoding="utf-8").strip()
+
+
+def gap_report(scenarios: list[Scenario], gaps: list[str]) -> list[str]:
+  pair_gaps = [g for g in gaps if g.startswith("mode ")]
+  other = [g for g in gaps if not g.startswith("mode ")]
+  pairs = {(s.mode, s.param) for s in scenarios}
+  lines = [f"not covered: {len(pair_gaps)} of {len(pairs) + len(pair_gaps)} safety mode/param pairs have no usable route, so no car drives them:"]
+  for gap in pair_gaps:
+    mode, rest = re.fullmatch(r"mode (\d+) (.*)", gap).groups()
+    lines.append(f"  {SAFETY_MODELS[int(mode)]} {rest}")
+  return lines + [f"  {gap}" for gap in other]
 
 
 @dataclass
@@ -87,10 +98,9 @@ class TestCars(OpenpilotTestCase):
     # alfred runs a job with shards = N as N jobs, each drives every Nth scenario
     shard, shards = int(os.getenv("ALFRED_SHARD", "0")), int(os.getenv("ALFRED_SHARDS", "1"))
     cls.shard_label = f"shard {shard}/{shards}: " if "ALFRED_SHARDS" in os.environ else ""
+    cls.job = f"cars{shard}" if "ALFRED_SHARDS" in os.environ else "cars"
     if shard == 0:
-      print(f"{len(gaps)} gaps (not driven):", flush=True)
-      for gap in gaps:
-        print(f"  {gap}", flush=True)
+      print("\n".join(gap_report(scenarios, gaps)), flush=True)
     models = [m.strip() for m in os.getenv("SCENARIOS", "").split(",") if m.strip()]
     cls.unmatched = [m for m in models if not any(m in (s.car_model, f"{s.car_model}:{s.param}") for s in scenarios)]
     car_models = [s.car_model for s in scenarios]
@@ -102,9 +112,7 @@ class TestCars(OpenpilotTestCase):
       print(f"{cls.shard_label}drives {', '.join(s.car_model for s in scenarios) or 'nothing'}", flush=True)
 
     cls.results = [DriveResult(s, shared_model=car_models.count(s.car_model) > 1) for s in scenarios]
-    log_dir = tempfile.mkdtemp(prefix="test_cars_")
-    print(f"manager logs in {log_dir}", flush=True)
-    drive = Drive(UP.remote(), log_dir)
+    drive = Drive(UP.remote())
     start = time.monotonic()
     # builds the next car's replay while this one drives, at the lowest priority so openpilot keeps its cpu
     def new_pool() -> ProcessPoolExecutor:
@@ -126,6 +134,7 @@ class TestCars(OpenpilotTestCase):
           result.status = "failed"
           result.error = f"replay build crashed: {crash}"
         else:
+          print(f"=== {result.name} ===", flush=True)
           cls.drive_one(drive, result, current)
         print(result.line(), flush=True)
         if result.status == "failed":
@@ -140,8 +149,7 @@ class TestCars(OpenpilotTestCase):
     not_driven = sum(r.status == NOT_DRIVEN for r in cls.results)
     failed = len(cls.results) - passed - not_driven
     rig = f", {not_driven} not driven after a rig problem" if not_driven else ""
-    cls.summary = f"{cls.shard_label}{passed} passed, {failed} failed{rig}, {len(gaps)} gaps (not driven), {(time.monotonic() - start) / 60:.1f} min"
-    print(cls.summary, flush=True)
+    cls.summary = f"{cls.job}: {passed} passed, {failed} failed{rig}, {(time.monotonic() - start) / 60:.1f} min"
 
   @staticmethod
   def drive_one(drive: Drive, result: DriveResult, replay: Future) -> None:
@@ -187,7 +195,7 @@ class TestCars(OpenpilotTestCase):
 
 
 if __name__ == "__main__":
-  # unittest's tracebacks scroll the results away, so print them again last, its footer goes to stdout too so ours is the end
+  # unittest's tracebacks scroll the results away, so the results are printed once, last, after its footer (also on stdout)
   program = unittest.main(testRunner=unittest.TextTestRunner(stream=sys.stdout), exit=False)
   sys.stdout.flush()
   sys.stderr.flush()
