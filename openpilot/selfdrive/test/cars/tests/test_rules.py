@@ -4,7 +4,8 @@ import unittest
 from opendbc.car.structs import CarParams
 
 from openpilot.cereal.messaging import new_message
-from openpilot.selfdrive.test.cars.rules import SAFETY_STATE, TRANSITION, is_event, log_line, rule_checks, rule_failures
+from openpilot.selfdrive.test.cars.rules import (SAFETY_STATE, TRANSITION, _tx_timing, cadence, is_event, log_line, rule_checks,
+                                                 rule_failures)
 
 TOYOTA = int(CarParams.SafetyModel.toyota)
 
@@ -349,6 +350,23 @@ class TestRules(unittest.TestCase):
     result = failures(idle(cadence_drive(2, 4.), since=3.), max_idle=1)
     assert len(result) == 1
     assert result[0].startswith("t=3.01 commands stopped while engaged")
+
+
+
+class TestTxTiming(unittest.TestCase):
+  def test_burst_after_stall(self):
+    # three echoes at 20 ms, a 160 ms stall, then a burst of three
+    echoes = [0., 0.02, 0.04, 0.2, 0.2, 0.2]
+    recent, max_gap, burst = _tx_timing(echoes, 0.2)
+    assert (recent, burst) == (6, 3)
+    assert abs(max_gap - 0.16) < 1e-9
+    # only the RT window before counts
+    assert _tx_timing(echoes + [0.4], 0.4)[0] == 4
+
+  def test_cadence(self):
+    # the echoes come 10 ms after card's sendcan, a second apart
+    assert cadence(clean_drive(4.)) == "longest gaps while engaged: sendcan 1000 ms, TX echoes 1000 ms"
+
 
 
 if __name__ == "__main__":

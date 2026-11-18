@@ -14,7 +14,8 @@ from openpilot.common.basedir import BASEDIR
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.test.cars.drive import Drive, DriveFailed, RigProblem
 from openpilot.selfdrive.test.cars.replay import BUDGET, Replay, scenario_replay
-from openpilot.selfdrive.test.cars.rules import SAFETY_MODELS, Check, failure_lines, fingerprinted, load_libsafety, rule_checks, summary
+from openpilot.selfdrive.test.cars.rules import (SAFETY_MODELS, Check, cadence, failure_lines, fingerprinted, load_libsafety, rule_checks,
+                                                 summary)
 from openpilot.selfdrive.test.cars.scenario import DASHCAM_ONLY, Scenario, load_scenarios
 
 NOT_DRIVEN = "not driven"
@@ -59,6 +60,8 @@ class DriveResult:
   stats: str = ""
   # card's fingerprinted record
   fingerprinted: str = ""
+  # card's and pandad's longest gaps while engaged
+  cadence: str = ""
   took: float = 0.
   # seconds of each phase of the drive
   timing: dict[str, float] = field(default_factory=dict)
@@ -111,6 +114,8 @@ class DriveResult:
       lines += self.error.splitlines()
     for check in self.checks or []:
       lines += check.lines()
+    if self.cadence:
+      lines.append(self.cadence)
     if self.timing:
       phases = ", ".join(f"{name} {seconds:.1f} s" for name, seconds in self.timing.items())
       lines.append(f"time: {phases}, total {self.took:.0f} s")
@@ -208,6 +213,7 @@ class TestCars(OpenpilotTestCase):
       result.failures = failure_lines(result.checks)
       result.stats = summary(log.msgs, start=log.start)
       result.fingerprinted = fingerprinted(log.msgs)
+      result.cadence = cadence(log.msgs, start=log.start)
       result.status = "passed" if not result.failures else "failed"
     except RigProblem as e:
       result.status = RIG_PROBLEM

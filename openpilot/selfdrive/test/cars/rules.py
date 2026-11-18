@@ -37,6 +37,8 @@ TRANSITION = 3
 # may idle a cycle more than on the route when card's cycles jitter, commands stopped is a longer run
 IDLE_JITTER = 1
 # libsafety's state the TX checks depend on
+# the panda's real-time TX checks (rt_torque_rate_limit_check and the like) count frames in this window of its timer
+RT_INTERVAL = 0.25
 SAFETY_STATE = ('controls_allowed', 'gas_pressed_prev', 'brake_pressed_prev', 'regen_braking_prev', 'steering_disengage_prev',
                 'cruise_engaged_prev', 'vehicle_moving', 'acc_main_on', 'relay_malfunction')
 
@@ -307,10 +309,18 @@ class Decision:
   allowed: bool
   state: dict[str, bool]
   since_change: float
+  # whether pandad stalled: seconds from card's sendcan to the panda's echo, the TX frames echoed in the RT_INTERVAL before,
+  # the longest gap between their echoes and the TX frames echoed with this one
+  delay: float = 0.
+  recent: int = 0
+  max_gap: float = 0.
+  burst: int = 0
 
   def describe(self) -> str:
     state = ", ".join(f"{name} {int(value)}" for name, value in self.state.items())
-    return f"libsafety {'allows' if self.allowed else 'blocks'} it: {state}, changed {self.since_change * 1e3:.0f} ms before"
+    recent = f"{self.recent} TX frames echoed in the {RT_INTERVAL * 1e3:.0f} ms before, largest gap {self.max_gap * 1e3:.0f} ms"
+    timing = f"sendcan to echo {self.delay * 1e3:.0f} ms, {recent}, {self.burst} echoed with it"
+    return f"libsafety {'allows' if self.allowed else 'blocks'} it: {state}, changed {self.since_change * 1e3:.0f} ms before. {timing}"
 
 
 def _safety_state(safety) -> dict[str, bool]:
@@ -326,6 +336,14 @@ def _sent(pending: list[tuple[bytes, int]], dat: bytes) -> int | None:
   return None
 
 
+def _tx_timing(echoes: list[float], t: float) -> tuple[int, float, int]:
+  # the TX frames echoed in the RT_INTERVAL before t, the longest gap between their echoes, and the ones echoed at t
+  recent = echoes[bisect.bisect_left(echoes, t - RT_INTERVAL):]
+  times = sorted(set(recent))
+  gaps = [b - a for a, b in zip(times, times[1:], strict=False)]
+  return len(recent), max(gaps, default=0.), recent.count(t)
+
+
 def _tx_hook(safety, addr: int, bus: int, dat: bytes, t: float) -> bool:
   safety.set_timer(round(t * 1e6) & 0xFFFFFFFF)
   return bool(safety.safety_tx_hook(libsafety_py.make_CANPacket(addr, bus, dat)))
@@ -334,8 +352,9 @@ def _tx_hook(safety, addr: int, bus: int, dat: bytes, t: float) -> bool:
 def safety_decisions(rec: Recording, mode: int, param: int, safety) -> dict[tuple[int, int], Decision]:
   # (message index, frame index) of each frame openpilot sent that the panda sent (src + 128) or blocked (src + 192) -> libsafety's decision.
   # the panda queues its echo or block of a frame with the rx (src 0-2) as its tx hook takes it, so libsafety takes the frame there,
-  # at the time card's sendcan passed it on and with openpilot's engaged state in the heartbeat. the panda also echoes the frames it
-  # forwards, those match no sent frame
+  # with openpilot's engaged state in the heartbeat. its real-time checks count frames on its timer as they arrive, so libsafety
+  # times each frame by its echo like the rx, not by card's sendcan, a pandad stall sends a burst. the panda also echoes the frames
+  # it forwards, those match no sent frame
   if safety.set_safety_hooks(mode, param) != 0:
     return {}
   first = rec.msgs[0].logMonoTime if rec.msgs else 0
@@ -345,6 +364,8 @@ def safety_decisions(rec: Recording, mode: int, param: int, safety) -> dict[tupl
   tick = None
   state = _safety_state(safety)
   changed = 0.
+  # the time of each TX frame's echo, in order
+  echoes: list[float] = []
   for i, msg in enumerate(rec.msgs):
     which = msg.which()
     t = (msg.logMonoTime - first) / 1e9
@@ -373,14 +394,15 @@ def safety_decisions(rec: Recording, mode: int, param: int, safety) -> dict[tupl
         taken = _sent(sent, bytes(frame.dat))
         if taken is None:
           continue
-        # the panda echoes a bus's frames in order, it took the ones before this one but their echo is lost
-        for dat, sent_at in sent[:taken - 1]:
-          _tx_hook(safety, frame.address, bus, dat, (sent_at - first) / 1e9)
+        # the panda echoes a bus's frames in order, it took the ones before this one but their echo is lost, by this echo's time
+        for dat, _ in sent[:taken - 1]:
+          _tx_hook(safety, frame.address, bus, dat, t)
         dat, sent_at = sent[taken - 1]
-        allowed = _tx_hook(safety, frame.address, bus, dat, (sent_at - first) / 1e9)
+        allowed = _tx_hook(safety, frame.address, bus, dat, t)
         del sent[:taken]
-        safety.set_timer(round(t * 1e6) & 0xFFFFFFFF)
-        decisions[(i, k)] = Decision(allowed, state, t - changed)
+        echoes += [t] * taken
+        recent, max_gap, burst = _tx_timing(echoes, t)
+        decisions[(i, k)] = Decision(allowed, state, t - changed, t - (sent_at - first) / 1e9, recent, max_gap, burst)
       now = _safety_state(safety)
       if now != state:
         state = now
@@ -412,6 +434,10 @@ def block_context(rec: Recording, i: int, frame, decision: Decision | None, dbcs
     p = panda[0]
     checks = f"rx checks invalid {int(p.safetyRxChecksInvalid)}, tx blocked {p.safetyTxBlocked}"
     lines.append(f"panda: controls_allowed {int(p.controlsAllowed)}, rx invalid {p.safetyRxInvalid}, {checks}")
+    # pandad's link to the panda over the recording
+    start = next(state for _, state in _panda_states(rec))
+    link = [f"{name} +{getattr(p, name) - getattr(start, name)}" for name in ('spiErrorCount', 'txBufferOverflow', 'rxBufferOverflow')]
+    lines.append(f"panda link since the recording's start: {', '.join(link)}")
   if decision is not None:
     lines.append(decision.describe())
   CS = _latest(rec, i, 'carState')
@@ -659,6 +685,28 @@ def failure_lines(checks: list[Check]) -> list[str]:
 
 def rule_failures(msgs: list, mode: int, param: int, max_idle: int, start: int | None = None, safety=None, why_not: str = "") -> list[str]:
   return failure_lines(rule_checks(msgs, mode, param, max_idle, start, safety, why_not))
+
+
+def cadence(msgs: list, start: int | None = None) -> str:
+  # the longest gaps of card's carControl and sendcan and of the panda's TX echoes while engaged, a pandad stall shows in the echoes
+  rec = _load(msgs, start)
+  times: dict[str, list[tuple[int, float]]] = {'carControl': [], 'sendcan': [], 'TX echoes': []}
+  for i, msg in enumerate(rec.msgs):
+    if not _judged_engaged(rec, i):
+      continue
+    which = msg.which()
+    if which == 'can':
+      if not any(c.src - ECHO_BASE in range(BUSES) for c in msg.can):
+        continue
+      which = 'TX echoes'
+    if which in times:
+      times[which].append((rec.span_at(i), rec.t(i)))
+  parts = []
+  for name, spans in times.items():
+    gaps = [b - a for (span_a, a), (span_b, b) in zip(spans, spans[1:], strict=False) if span_a == span_b]
+    if gaps:
+      parts.append(f"{name} {max(gaps) * 1e3:.0f} ms")
+  return f"longest gaps while engaged: {', '.join(parts)}" if parts else ""
 
 
 def summary(msgs: list, start: int | None = None) -> str:
