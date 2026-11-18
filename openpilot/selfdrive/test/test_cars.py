@@ -50,6 +50,7 @@ class DriveResult:
   took: float = 0.
   # seconds of each phase of the drive
   timing: dict[str, float] = field(default_factory=dict)
+  slowest_exits: list[tuple[str, float]] = field(default_factory=list)
 
   @property
   def name(self) -> str:
@@ -94,6 +95,8 @@ class DriveResult:
     if self.timing:
       phases = ", ".join(f"{name} {seconds:.1f} s" for name, seconds in self.timing.items())
       lines.append(f"time: {phases}, total {self.took:.0f} s")
+    if self.slowest_exits:
+      lines.append(f"slowest to exit at stop: {', '.join(f'{name} {seconds:.1f} s' for name, seconds in self.slowest_exits)}")
     return [f"    {line}" for line in lines]
 
 
@@ -173,6 +176,7 @@ class TestCars(OpenpilotTestCase):
     s = result.scenario
     start = time.monotonic()
     drive.timing = {}
+    drive.slowest_exits = []
     try:
       result.replay = replay.result()
       log = drive.run(s, result.replay)
@@ -191,6 +195,7 @@ class TestCars(OpenpilotTestCase):
       result.error = repr(e)
     result.took = time.monotonic() - start
     result.timing = dict(drive.timing)
+    result.slowest_exits = list(drive.slowest_exits)
 
   def test_something_driven(self):
     assert not self.unmatched, f"SCENARIOS matched nothing for: {', '.join(self.unmatched)}"

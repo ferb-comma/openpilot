@@ -1,5 +1,4 @@
 # one scenario on a DUT in an ultimate provisioning (UP) station, the UP plays the scenario's car
-import math
 import os
 import signal
 import subprocess
@@ -41,7 +40,7 @@ class DriveLog:
 
 
 def onroad_missing(sm) -> list[str]:
-  # what keeps openpilot from being onroad, empty once it is
+  # what keeps openpilot from being onroad with selfdrived initialized, empty once it is
   missing = []
   if not sm['deviceState'].started:
     missing.append("not started")
@@ -54,6 +53,11 @@ def onroad_missing(sm) -> list[str]:
     missing.append("no panda")
   elif sm['pandaStates'][0].safetyModel.raw in NO_CAR_MODES:
     missing.append(f"panda in {sm['pandaStates'][0].safetyModel}")
+  # selfdrived blocks engaging until its services are valid, or for up to its init timeout
+  if not sm.recv_frame['onroadEvents']:
+    missing.append("no onroadEvents")
+  elif any(str(event.name) == 'selfdriveInitializing' for event in sm['onroadEvents']):
+    missing.append("selfdrived initializing")
   return missing
 
 
@@ -64,6 +68,24 @@ def fd_buses(frames: list[Frame]) -> list[int]:
 
 def manager_died(rc: int) -> DriveFailed:
   return DriveFailed(f"manager died: rc {rc}")
+
+
+def group_processes(pgid: int) -> dict[int, str]:
+  # pid -> name of each live process in a process group
+  procs = {}
+  for pid in os.listdir('/proc'):
+    if not pid.isdigit():
+      continue
+    try:
+      with open(f'/proc/{pid}/stat') as f:
+        stat = f.read()
+    except OSError:
+      continue
+    # the name is in parentheses and may hold spaces, then state, ppid and pgrp
+    state, _, pgrp = stat[stat.rindex(')') + 2:].split()[:3]
+    if int(pgrp) == pgid and state != 'Z':
+      procs[int(pid)] = stat[stat.index('(') + 1:stat.rindex(')')]
+  return procs
 
 
 def _signal_group(pgid: int, sig: signal.Signals) -> None:
@@ -80,6 +102,8 @@ class Drive:
     self._started = 0.
     # seconds of each phase of the last run, in order
     self.timing: dict[str, float] = {}
+    # the processes that took longest to exit in the last stop, and their seconds
+    self.slowest_exits: list[tuple[str, float]] = []
 
   def _up(self, call: str, *args):
     # the UP not answering is the rack's problem
@@ -109,11 +133,18 @@ class Drive:
       return
     manager, self._manager = self._manager, None
     rc = manager.poll()
+    alive = group_processes(manager.pid)
+    interrupted = time.monotonic()
     _signal_group(manager.pid, signal.SIGINT)
-    try:
-      manager.wait(60)
-    except subprocess.TimeoutExpired:
-      pass
+    # when each process exits, the manager gives each 5 s after SIGINT before SIGKILL
+    exits: dict[str, float] = {}
+    while manager.poll() is None and time.monotonic() < interrupted + 60:
+      now = group_processes(manager.pid)
+      for pid in alive.keys() - now.keys():
+        exits[alive[pid]] = time.monotonic() - interrupted
+      alive = now
+      time.sleep(DT * 5)
+    self.slowest_exits = sorted(exits.items(), key=lambda e: -e[1])[:3]
     _signal_group(manager.pid, signal.SIGKILL)
     manager.wait()
     if rc is not None:
@@ -163,14 +194,13 @@ class Drive:
           missing.append(f"last error {error}")
         raise DriveFailed(f"not onroad {ONROAD_LIMIT:g} s after manager start: {', '.join(missing)}")
 
-  def _record(self, start: float, end: float, error_sock, errors: list) -> list:
-    while time.monotonic() < start - PREROLL:
+  def _wait(self, until: float, error_sock, errors: list) -> None:
+    while time.monotonic() < until:
       self._check_manager()
       errors += messaging.drain_sock(error_sock)
       time.sleep(DT)
-    socks = [messaging.sub_sock(s, conflate=False) for s in RECORD]
-    for sock in socks:
-      messaging.drain_sock_raw(sock)
+
+  def _record(self, socks: list, end: float, error_sock, errors: list) -> list:
     msgs = []
     while time.monotonic() < end:
       self._check_manager()
@@ -185,11 +215,12 @@ class Drive:
     return msgs
 
   def run(self, scenario: Scenario, replay: Replay) -> DriveLog:
-    # the UP loops the window from its call until reset, each loop a lead-in, the engage edge, the engaged stretch and the wrap
+    # the UP loops the window from each can_replay call until reset, each loop a lead-in, the engage edge, the engaged stretch and the wrap
     self.timing = {}
+    self.slowest_exits = []
     frames = replay.frames
     buses = {bus for frame in frames for _, _, bus in frame}
-    sm = messaging.SubMaster(['deviceState', 'carState', 'managerState', 'pandaStates'])
+    sm = messaging.SubMaster(['deviceState', 'carState', 'managerState', 'pandaStates', 'onroadEvents'])
     can_sock = messaging.sub_sock('can', conflate=False)
     # every error since openpilot started, not just the recording window's
     error_sock = messaging.sub_sock('errorLogMessage', conflate=False)
@@ -204,15 +235,20 @@ class Drive:
       for bus in fd_buses(frames):
         self._up('set_can_data_speed_kbps', bus, can_states[bus].canDataSpeed)
       self._up('can_replay', frames)
-      # the loop's 10 ms clock starts as can_replay returns
-      t0 = time.monotonic()
-      period = len(frames) * DT
       self.timing['manager start → onroad'] = self._wait_onroad(sm, can_sock, error_sock, errors, buses)
-      # record from the next loop start through its engage edge and the engaged stretch after it
-      start = t0 + math.ceil((time.monotonic() - t0) / period) * period
+      # a new loop from here instead of waiting for this one to wrap, so its lead-in plays with openpilot up,
+      # recorded from that loop's start through its engage edge and the engaged stretch after it
+      restart = time.monotonic()
+      socks = [messaging.sub_sock(s, conflate=False) for s in RECORD]
+      for sock in socks:
+        messaging.drain_sock_raw(sock)
+      self._wait(restart + PREROLL, error_sock, errors)
+      self._up('can_replay', frames)
+      # the loop's 10 ms clock starts as can_replay returns
+      start = time.monotonic()
+      self.timing['replay restart'] = start - restart
       end = start + (scenario.rise - scenario.window.start) + ENGAGED_RECORD
-      self.timing['wait for loop'] = start - self._started - self.timing['manager start → onroad']
-      msgs = self._record(start, end, error_sock, errors)
+      msgs = self._record(socks, end, error_sock, errors)
       self.timing['record'] = time.monotonic() - start
       return DriveLog(msgs + errors, int(start * 1e9))
     finally:
