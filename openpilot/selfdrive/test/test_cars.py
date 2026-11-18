@@ -83,14 +83,22 @@ class TestCars(OpenpilotTestCase):
   def setup_class(cls):
     from ultimate_provisioning import UP  # only on a DUT, from its UP's up run or up ssh
     scenarios, gaps = load_scenarios()
-    print(f"{len(gaps)} gaps (not driven):", flush=True)
-    for gap in gaps:
-      print(f"  {gap}", flush=True)
+    # alfred runs a job with shards = N as N jobs, each drives every Nth scenario
+    shard, shards = int(os.getenv("ALFRED_SHARD", "0")), int(os.getenv("ALFRED_SHARDS", "1"))
+    cls.shard_label = f"shard {shard}/{shards}: " if "ALFRED_SHARDS" in os.environ else ""
+    if shard == 0:
+      print(f"{len(gaps)} gaps (not driven):", flush=True)
+      for gap in gaps:
+        print(f"  {gap}", flush=True)
     models = [m.strip() for m in os.getenv("SCENARIOS", "").split(",") if m.strip()]
     cls.unmatched = [m for m in models if not any(m in (s.car_model, f"{s.car_model}:{s.param}") for s in scenarios)]
     car_models = [s.car_model for s in scenarios]
     if models:
       scenarios = [s for s in scenarios if s.car_model in models or f"{s.car_model}:{s.param}" in models]
+    cls.nothing_to_drive = bool(scenarios) and not scenarios[shard::shards]
+    scenarios = scenarios[shard::shards]
+    if cls.shard_label:
+      print(f"{cls.shard_label}drives {', '.join(s.car_model for s in scenarios) or 'nothing'}", flush=True)
 
     cls.results = [DriveResult(s, shared_model=car_models.count(s.car_model) > 1) for s in scenarios]
     log_dir = tempfile.mkdtemp(prefix="test_cars_")
@@ -131,7 +139,7 @@ class TestCars(OpenpilotTestCase):
     not_driven = sum(r.status == NOT_DRIVEN for r in cls.results)
     failed = len(cls.results) - passed - not_driven
     rig = f", {not_driven} not driven after a rig problem" if not_driven else ""
-    cls.summary = f"{passed} passed, {failed} failed{rig}, {len(gaps)} gaps (not driven), {(time.monotonic() - start) / 60:.1f} min"
+    cls.summary = f"{cls.shard_label}{passed} passed, {failed} failed{rig}, {len(gaps)} gaps (not driven), {(time.monotonic() - start) / 60:.1f} min"
     print(cls.summary, flush=True)
 
   @staticmethod
@@ -158,6 +166,9 @@ class TestCars(OpenpilotTestCase):
 
   def test_something_driven(self):
     assert not self.unmatched, f"SCENARIOS matched nothing for: {', '.join(self.unmatched)}"
+    if self.nothing_to_drive:
+      print(f"{self.shard_label}nothing to drive, more shards than scenarios")
+      return
     assert self.results, "no scenarios were driven"
 
   def test_driven(self, subtests):
