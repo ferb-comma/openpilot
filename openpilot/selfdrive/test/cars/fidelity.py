@@ -69,12 +69,13 @@ def selfdrive(CP: structs.CarParams, states: list[structs.CarState]) -> list[Ste
   car_events = CarEvents(CP)
   machine = StateMachine()
   v_cruise = VCruiseHelper(CP)
-  CC = structs.CarControl()
   prev = structs.CarState()
   enabled = False
   steps = []
   for CS in states:
     v_cruise.update_v_cruise(CS, enabled, False)
+    # the car events that disengage depend on whether openpilot is engaged
+    CC = structs.CarControl(enabled=enabled, latActive=enabled, longActive=enabled and CP.openpilotLongitudinalControl)
     events = Events()
     if CS.canValid:
       events = car_events.update(CS, prev, CC)
