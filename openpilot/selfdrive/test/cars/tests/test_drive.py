@@ -1,6 +1,13 @@
 import unittest
 
-from openpilot.selfdrive.test.cars.drive import PREROLL, recorded_loop
+from openpilot.cereal.services import SERVICE_LIST
+from openpilot.selfdrive.test.cars.drive import CAMERAS, PREROLL, RECORD, recorded_loop
+
+
+class TestServices(unittest.TestCase):
+  def test_services_exist(self):
+    for service in (*CAMERAS, *RECORD):
+      assert service in SERVICE_LIST, service
 
 
 class TestRecordedLoop(unittest.TestCase):

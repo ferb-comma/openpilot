@@ -18,8 +18,9 @@ from openpilot.selfdrive.test.cars.scenario import TAIL, Scenario
 ONROAD_LIMIT = 45.
 # subscribed this long before the recording window, so the states before its start are known
 PREROLL = 0.5
-# the DUT's cameras, selfdrived doesn't engage while one isn't streaming
-CAMERAS = ('roadCameraState', 'driverCameraState')
+# the DUT's cameras, selfdrived doesn't engage without the cabin camera and the road cameras the device has
+ROAD_CAMERAS = ('narrowRoadCameraState', 'wideRoadCameraState')
+CAMERAS = ('cabinCameraState', *ROAD_CAMERAS)
 RECORD = ('can', 'sendcan', 'pandaStates', 'selfdriveState', 'carState', 'carControl', 'onroadEvents', 'managerState')
 # the panda marks its own tx echoes with src + 128
 ECHO = 128
@@ -45,9 +46,10 @@ def onroad_missing(sm) -> list[str]:
   missing = []
   if not sm['deviceState'].started:
     missing.append("not started")
-  for camera in CAMERAS:
-    if not sm.alive[camera]:
-      missing.append(f"camera not streaming: no {camera}")
+  if not sm.alive['cabinCameraState']:
+    missing.append("camera not streaming: no cabinCameraState")
+  if not any(sm.alive[camera] for camera in ROAD_CAMERAS):
+    missing.append(f"camera not streaming: none of {', '.join(ROAD_CAMERAS)}")
   if not sm['carState'].canValid:
     missing.append("carState not canValid")
   stopped = [p.name for p in sm['managerState'].processes if p.shouldBeRunning and not p.running]
