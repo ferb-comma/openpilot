@@ -1,6 +1,7 @@
 # whether a scenario's replay plays its car like the route's window does, checked on a PC when scenarios are generated
 import logging
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from functools import partial
 
@@ -42,20 +43,57 @@ def _field(CS: structs.CarState, name: str):
   return value
 
 
+@contextmanager
+def _quiet_carlog():
+  # the parsers log a bus timeout on every gap of the thinned frames
+  carlog = logging.getLogger("carlog")
+  level, carlog.level = carlog.level, logging.CRITICAL
+  try:
+    yield
+  finally:
+    carlog.setLevel(level)
+
+
+def _looped(frames: list[Frame]):
+  # (loop, time, packet) of each frame of LOOPS loops
+  loop = round(len(frames) * DT * 1e9)
+  for n in range(LOOPS):
+    for t, packet in packets(frames):
+      yield n, t + n * loop, packet
+
+
 def car_states(CP: structs.CarParams, frames: list[Frame]) -> list[structs.CarState]:
   # the DUT's carState each frame of LOOPS loops of the frames, as card publishes it
   car = interfaces[CP.carFingerprint](CP)
-  carlog = logging.getLogger("carlog")
-  level, carlog.level = carlog.level, logging.CRITICAL
-  loop = round(len(frames) * DT * 1e9)
-  states = []
-  try:
-    for n in range(LOOPS):
-      for t, packet in packets(frames):
-        states.append(car.update([(t + n * loop, packet)]))
-  finally:
-    carlog.setLevel(level)
-  return states
+  with _quiet_carlog():
+    return [car.update([(t, packet)]) for _, t, packet in _looped(frames)]
+
+
+def controller_idle(CP: structs.CarParams, frames: list[Frame], enabled: list[bool]) -> int | None:
+  # the longest run of cycles the DUT's car controller sends nothing between two commands while openpilot is engaged in the
+  # second loop, its command cadence on the replay. None without two commands
+  car = interfaces[CP.carFingerprint](CP)
+  longest = None
+  run = None
+  with _quiet_carlog():
+    for i, (n, t, packet) in enumerate(_looped(frames)):
+      CS = car.update([(t, packet)])
+      on = enabled[i]
+      # as controlsd sets them
+      standstill = abs(CS.vEgo) <= max(CP.minSteerSpeed, 0.3) or CS.standstill
+      lat = on and not CS.steerFaultTemporary and not CS.steerFaultPermanent and (not standstill or CP.steerAtStandstill)
+      # card passes the carControl it reads
+      CC = structs.CarControl(enabled=on, latActive=lat, longActive=on and CP.openpilotLongitudinalControl).as_reader()
+      _, sends = car.apply(CC, t)
+      if n < LOOPS - 1 or not on:
+        run = None
+      elif sends:
+        if run is not None:
+          longest = max(longest or 0, run)
+        run = 0
+      elif run is not None:
+        run += 1
+  return longest
 
 
 @dataclass
@@ -137,6 +175,8 @@ class Engage:
   # the panda's controls_allowed and openpilot's enabled each frame of the second loop up to its end
   allowed: list[bool]
   enabled: list[bool]
+  # openpilot's enabled each frame of every loop
+  looped_enabled: list[bool]
 
 
 def engage(CP: structs.CarParams, mode: int, param: int, frames: list[Frame], end: float,
@@ -170,8 +210,9 @@ def engage(CP: structs.CarParams, mode: int, param: int, frames: list[Frame], en
     if since is not None and not allowed[i] and i - since > limit:
       dropped = i - n
       break
+  looped_enabled = [s.enabled for s in steps]
   return Engage([r - n for r in rises], enabled_at, blocked, allowed[n], carried, dropped, allowed[n:last + 1],
-                [s.enabled for s in steps[n:last + 1]])
+                looped_enabled[n:last + 1], looped_enabled)
 
 
 def engage_problems(e: Engage, end: float) -> list[str]:
@@ -237,6 +278,8 @@ class Fidelity:
   fields: dict[str, str]
   # frames after the panda's edge that openpilot engages on the replay
   delay: int | None
+  # the DUT controller's longest run of cycles without a command while engaged on the replay
+  idle: int | None = None
 
   @property
   def problems(self) -> list[str]:
@@ -277,7 +320,8 @@ def fidelity(CP: structs.CarParams, mode: int, param: int, window: list[Frame], 
   delay = None
   if played.rises and played.enabled_at[0] is not None:
     delay = played.enabled_at[0] - played.rises[0]
-  return Fidelity(window_problems, played_problems, diverging(route_states, replay_states), delay)
+  idle = controller_idle(CP, replay, played.looped_enabled)
+  return Fidelity(window_problems, played_problems, diverging(route_states, replay_states), delay, idle)
 
 
 def _keys(keys) -> str:
@@ -326,25 +370,34 @@ def faithful_messages(s: Scenario, car: RouteCar, msgs: list, budget: dict[int, 
   return sorted(keep)
 
 
+def _cadence(s: Scenario, f: Fidelity | None) -> Scenario:
+  # the route logged an older controller's cadence, the DUT runs the current one, the longer of the two
+  if f is None or f.idle is None:
+    return s
+  return replace(s, max_idle=max(s.max_idle, f.idle))
+
+
 def check_scenario(s: Scenario, car: RouteCar, msgs: list, budget: dict[int, float]) -> tuple[Scenario, list[str]]:
   # the scenario, with the messages its replay keeps more frames of where thinning changes carState, and its problems.
   # changed fields that don't change how the replay engages only cost the scenario if keeping their messages doesn't fit
   problems, f = replay_problems(s, car, msgs, budget)
   if f is None or f.window or not (problems or f.fields):
-    return s, problems
+    return _cadence(s, f), problems
   keys = faithful_messages(s, car, msgs, budget)
   if keys is None:
-    return s, problems + ["keeping every frame of the messages thinning drops doesn't help"] if problems else []
+    if not problems:
+      return _cadence(s, f), []
+    return s, problems + ["keeping every frame of the messages thinning drops doesn't help"]
   # the fewest frames first, every k-th frame moves a change by at most k - 1 frames
   first_problems = None
   for k in range(SLACK + 1, 0, -1):
     kept = replace(s, kept=tuple((bus, addr, k) for bus, addr in keys))
     kept_problems, kept_f = replay_problems(kept, car, msgs, budget)
     if not kept_problems and kept_f is not None and not kept_f.fields:
-      return kept, []
+      return _cadence(kept, kept_f), []
     first_problems = kept_problems if first_problems is None else first_problems
   if not problems:
-    return s, []
+    return _cadence(s, f), []
   return s, problems + [f"keeping {_keys(keys)} every {SLACK + 1} frames: {', '.join(first_problems or ['carState still differs'])}"]
 
 

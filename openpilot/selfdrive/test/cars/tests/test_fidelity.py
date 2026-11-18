@@ -82,21 +82,21 @@ class TestSelfdrive(unittest.TestCase):
 
 class TestEngageProblems(unittest.TestCase):
   def test_engaged(self):
-    assert engage_problems(Engage([500], [500], [], False, False, None, [], []), 15.) == []
+    assert engage_problems(Engage([500], [500], [], False, False, None, [], [], []), 15.) == []
 
   def test_stays_allowed(self):
-    problems = engage_problems(Engage([], [], [], True, True, None, [], []), 15.)
+    problems = engage_problems(Engage([], [], [], True, True, None, [], [], []), 15.)
     assert problems == ["the panda stays allowed across the loop's wrap, nothing before the edge drops it"]
 
   def test_carried(self):
-    assert engage_problems(Engage([500], [500], [], False, True, None, [], []), 15.) == ["openpilot stays engaged across the loop's wrap"]
+    assert engage_problems(Engage([500], [500], [], False, True, None, [], [], []), 15.) == ["openpilot stays engaged across the loop's wrap"]
 
   def test_blocked(self):
-    problems = engage_problems(Engage([500], [None], ["resumeBlocked at 5.00 s"], False, False, None, [], []), 15.)
+    problems = engage_problems(Engage([500], [None], ["resumeBlocked at 5.00 s"], False, False, None, [], [], []), 15.)
     assert problems == ["openpilot doesn't engage at the panda's edge: resumeBlocked at 5.00 s"]
 
   def test_late_edge(self):
-    assert engage_problems(Engage([1200], [1200], [], False, False, None, [], []), 15.)[0].startswith("the panda's edge at 12.00 s leaves less than")
+    assert engage_problems(Engage([1200], [1200], [], False, False, None, [], [], []), 15.)[0].startswith("the panda's edge at 12.00 s leaves less than")
 
 
 class TestFidelityProblems(unittest.TestCase):
