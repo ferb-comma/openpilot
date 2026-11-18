@@ -1,4 +1,5 @@
 # one scenario on a DUT in an ultimate provisioning (UP) station, the UP plays the scenario's car
+import math
 import os
 import signal
 import subprocess
@@ -11,12 +12,12 @@ from openpilot.common.params import Params
 from openpilot.selfdrive.test.helpers import set_params_enabled
 from openpilot.selfdrive.test.cars.replay import DT, Frame, Replay
 from openpilot.selfdrive.test.cars.rules import NO_CAR_MODES, is_event, log_line
-from openpilot.selfdrive.test.cars.scenario import Scenario
+from openpilot.selfdrive.test.cars.scenario import MIN_ENGAGED, Scenario
 
 # seconds from manager start, ~2x the measured normal onroad time (20-25 s)
 ONROAD_LIMIT = 45.
 # long enough for ENGAGE_LIMIT plus a stretch of engaged commands
-ENGAGED_RECORD = 10.
+ENGAGED_RECORD = MIN_ENGAGED
 # subscribed this long before the recording window, so the states before its start are known
 PREROLL = 0.5
 RECORD = ('can', 'sendcan', 'pandaStates', 'selfdriveState', 'carState', 'onroadEvents', 'managerState')
@@ -218,7 +219,7 @@ class Drive:
     return msgs
 
   def run(self, scenario: Scenario, replay: Replay) -> DriveLog:
-    # the UP loops the window from each can_replay call until reset, each loop a lead-in, the engage edge, the engaged stretch and the wrap
+    # the UP loops the window from its can_replay call until reset, each loop a lead-in, the engage edge, the engaged stretch and the wrap
     self.timing = {}
     self.slowest_exits = []
     frames = replay.frames
@@ -240,19 +241,20 @@ class Drive:
       can_states = (panda.canState0, panda.canState1, panda.canState2)
       for bus in fd_buses(frames):
         self._up('set_can_data_speed_kbps', bus, can_states[bus].canDataSpeed)
+      # only once per car, a second can_replay call runs a second loop interleaved with the first, only reset stops them
       self._up('can_replay', frames)
+      # the loop's 10 ms clock starts as can_replay returns
+      t0 = time.monotonic()
+      period = len(frames) * DT
       self.timing['manager start → onroad'] = self._wait_onroad(sm, can_sock, error_sock, errors, buses)
-      # a new loop from here instead of waiting for this one to wrap, so its lead-in plays with openpilot up,
-      # recorded from that loop's start through its engage edge and the engaged stretch after it
-      restart = time.monotonic()
+      # record from the next loop start, subscribed PREROLL before it, through its engage edge and the engaged stretch after it
+      onroad = time.monotonic()
+      start = t0 + math.ceil((onroad + PREROLL - t0) / period) * period
+      self._wait(start - PREROLL, error_sock, errors)
       socks = [messaging.sub_sock(s, conflate=False) for s in RECORD]
       for sock in socks:
         messaging.drain_sock_raw(sock)
-      self._wait(restart + PREROLL, error_sock, errors)
-      self._up('can_replay', frames)
-      # the loop's 10 ms clock starts as can_replay returns
-      start = time.monotonic()
-      self.timing['replay restart'] = start - restart
+      self.timing['wait for loop'] = start - onroad
       end = start + (scenario.rise - scenario.window.start) + ENGAGED_RECORD
       msgs = self._record(socks, end, error_sock, errors)
       self.timing['record'] = time.monotonic() - start

@@ -18,8 +18,12 @@ from opendbc.safety.tests.libsafety import libsafety_py
 from openpilot.tools.lib.logreader import LogReader
 
 LEAD = 5.
-LENGTH = 30.
+# the engaged stretch the rules judge after the edge, the engage limit and a run of commands
 MIN_ENGAGED = 10.
+# slack after the recording so it ends before the loop wraps
+TAIL = 1.
+# the UP loops the window, so a short one keeps the wait for its next start short
+LENGTH = LEAD + MIN_ENGAGED + TAIL
 SCENARIOS = Path(__file__).parent / "scenarios.json"
 
 
