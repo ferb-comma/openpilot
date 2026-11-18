@@ -2,6 +2,7 @@
 import multiprocessing
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -186,8 +187,10 @@ class TestCars(OpenpilotTestCase):
 
 
 if __name__ == "__main__":
-  # unittest's tracebacks scroll the results away, so print them again last
-  program = unittest.main(exit=False)
+  # unittest's tracebacks scroll the results away, so print them again last, its footer goes to stdout too so ours is the end
+  program = unittest.main(testRunner=unittest.TextTestRunner(stream=sys.stdout), exit=False)
+  sys.stdout.flush()
+  sys.stderr.flush()
   for result in getattr(TestCars, "results", []):
     print(result.line())
     if result.status != "passed":
