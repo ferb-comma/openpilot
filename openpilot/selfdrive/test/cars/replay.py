@@ -6,7 +6,7 @@ from opendbc.can.dbc import DBC, Msg, SignalType
 from opendbc.can.packer import CANPacker
 from opendbc.car import gen_empty_fingerprint, structs
 from opendbc.car.can_definitions import CanData
-from opendbc.car.car_helpers import interfaces
+from opendbc.car.car_helpers import FRAME_FINGERPRINT, interfaces
 
 from openpilot.selfdrive.pandad import can_capnp_to_list
 from openpilot.selfdrive.test.cars.rules import BUSES
@@ -137,13 +137,15 @@ def _full_rate(dbcs: dict[tuple[int, int], str], parsed: dict[str, DBC], rx_chec
   return rx_checks[key] and not any(_is_counter(sig) for sig in msg.sigs.values())
 
 
-def thin(CP: structs.CarParams, rx_checks: dict[tuple[int, int], bool], frames: list[Frame], budget: dict[int, float]) -> list[Frame]:
+def thin(CP: structs.CarParams, rx_checks: dict[tuple[int, int], bool], frames: list[Frame], budget: dict[int, float],
+         keep_all: set[tuple[int, int]] | None = None) -> list[Frame]:
+  # keep_all: messages that keep every frame they have
   seconds = len(frames) * DT
   dbcs = _dbcs(CP)
   parsed = {name: DBC(name) for name in set(dbcs.values())}
   radar_trigger = _radar_trigger(CP)
   counts = Counter((bus, addr) for f in frames for addr, _, bus in f)
-  full = {key for key in counts if _full_rate(dbcs, parsed, rx_checks, radar_trigger, key)}
+  full = {key for key in counts if key in (keep_all or set()) or _full_rate(dbcs, parsed, rx_checks, radar_trigger, key)}
   # every k-th frame of each other message on a bus, in what the full rate messages leave of the budget
   keep = {}
   for bus, rate in budget.items():
@@ -250,19 +252,32 @@ def _dut_problem(car_model: str, CP: structs.CarParams, fingerprint: Fingerprint
   return None
 
 
-def fingerprint_problems(car_model: str, CP: structs.CarParams, fingerprint: Fingerprint, replay: list[Frame]) -> list[str]:
-  # card derives its car params from the fingerprint the replay presents, not the route's
-  presented = gen_empty_fingerprint()
-  for frame in replay:
+def presented(replay: list[Frame]) -> Fingerprint:
+  # the fingerprint card collects wherever in the loop it starts: the messages with a frame in every FRAME_FINGERPRINT frames
+  at: dict[tuple[int, int], list[int]] = {}
+  sizes = {}
+  for i, frame in enumerate(replay):
     for addr, dat, bus in frame:
-      presented[bus][addr] = len(dat)
-  problem = _dut_problem(car_model, CP, presented, replay)
-  if problem is None:
+      at.setdefault((bus, addr), []).append(i)
+      sizes[(bus, addr)] = len(dat)
+  fingerprint = gen_empty_fingerprint()
+  for (bus, addr), frames in at.items():
+    gaps = [b - a for a, b in zip(frames, frames[1:], strict=False)]
+    gaps.append(frames[0] + len(replay) - frames[-1])
+    if max(gaps) <= FRAME_FINGERPRINT:
+      fingerprint[bus][addr] = sizes[(bus, addr)]
+  return fingerprint
+
+
+def fingerprint_additions(car_model: str, CP: structs.CarParams, fingerprint: Fingerprint, replay: list[Frame]) -> list[tuple[int, int]]:
+  # the fewest of the route's fingerprint messages the replay drops that the DUT needs to derive CP, none if they can't
+  shown = presented(replay)
+  if _dut_problem(car_model, CP, shown, replay) is None:
     return []
-  differ = _differs(car_model, CP, presented)
-  # add the route's messages the replay drops back until the car params match, then take back the ones not needed
-  dropped = sorted((bus, addr) for bus, addrs in fingerprint.items() for addr, size in addrs.items() if presented[bus].get(addr) != size)
-  restored = {bus: dict(addrs) for bus, addrs in presented.items()}
+  in_replay = {(bus, addr) for frame in replay for addr, _, bus in frame}
+  dropped = sorted((bus, addr) for bus, addrs in fingerprint.items() for addr in addrs if bus < BUSES and (bus, addr) not in in_replay)
+  # add them until the car params match, then take back the ones not needed
+  restored = {bus: dict(addrs) for bus, addrs in shown.items()}
   added = []
   for bus, addr in dropped:
     restored[bus][addr] = fingerprint[bus][addr]
@@ -270,30 +285,59 @@ def fingerprint_problems(car_model: str, CP: structs.CarParams, fingerprint: Fin
     if not _differs(car_model, CP, restored):
       break
   else:
-    return [f"{problem} on the replay's fingerprint, car params differ: {', '.join(differ)}"]
+    return []
   for bus, addr in list(added):
     size = restored[bus].pop(addr)
-    if addr in presented[bus]:
-      restored[bus][addr] = presented[bus][addr]
     if _differs(car_model, CP, restored):
       restored[bus][addr] = size
     else:
       added.remove((bus, addr))
-  needs = ', '.join(f"{addr:#x} bus {bus}" for bus, addr in added)
-  return [f"{problem} on the replay's fingerprint, needs messages the replay drops: {needs} ({', '.join(differ)})"]
+  return added
 
 
-def build_replay(s: Scenario, CP: structs.CarParams, msgs: list, budget: dict[int, float]) -> list[Frame]:
+def fingerprint_frames(frames: list[Frame], keys: list[tuple[int, int]]) -> list[Frame]:
+  # the frames of these messages card needs to fingerprint them, the first, the last,
+  # and in between one at most FRAME_FINGERPRINT frames after the previous kept wherever the route allows
+  out: list[Frame] = [[] for _ in frames]
+  for key in keys:
+    at = [(i, (addr, dat, bus)) for i, frame in enumerate(frames) for addr, dat, bus in frame if (bus, addr) == key]
+    last = None
+    for j, (i, msg) in enumerate(at):
+      last_one = j == len(at) - 1
+      if last is None or last_one or at[j + 1][0] - last > FRAME_FINGERPRINT:
+        out[i].append(msg)
+        last = i
+  return out
+
+
+def fingerprint_problems(car_model: str, CP: structs.CarParams, replay: list[Frame]) -> list[str]:
+  # card derives its car params from the fingerprint the replay presents, not the route's
+  shown = presented(replay)
+  problem = _dut_problem(car_model, CP, shown, replay)
+  if problem is None:
+    return []
+  return [f"{problem} on the replay's fingerprint, car params differ: {', '.join(_differs(car_model, CP, shown))}"]
+
+
+def build_replay(s: Scenario, CP: structs.CarParams, fingerprint: Fingerprint, msgs: list, budget: dict[int, float]) -> list[Frame]:
   # what a station sends, one frame per DT
-  needed = needed_frames(CP, s.rx_checks, window_frames(msgs, s.window))
-  return thin(CP, s.rx_checks, needed, budget)
+  window = window_frames(msgs, s.window)
+  needed = needed_frames(CP, s.rx_checks, window)
+  replay = thin(CP, s.rx_checks, needed, budget)
+  added = fingerprint_additions(s.car_model, CP, fingerprint, replay)
+  if not added:
+    return replay
+  # the fingerprint messages count against the budget like the rest
+  sparse = fingerprint_frames(window, added)
+  merged = [a + b for a, b in zip(needed, sparse, strict=True)]
+  return thin(CP, s.rx_checks, merged, budget, set(added))
 
 
 def scenario_replay(s: Scenario) -> list[Frame]:
   # a scenario's replay from its route, built in a worker while the previous car drives
   try:
-    CP, _, msgs = load_scenario(s)
-    return build_replay(s, CP, msgs, BUDGET)
+    CP, fingerprint, msgs = load_scenario(s)
+    return build_replay(s, CP, fingerprint, msgs, BUDGET)
   except Exception as e:
     # the worker pickles exceptions back, and not every exception pickles
     raise RuntimeError(repr(e)) from None
@@ -301,8 +345,8 @@ def scenario_replay(s: Scenario) -> list[Frame]:
 
 def replay_problems(s: Scenario, CP: structs.CarParams, fingerprint: Fingerprint, msgs: list, budget: dict[int, float]) -> list[str]:
   # what keeps a scenario's replay from playing its car on a station
-  replay = build_replay(s, CP, msgs, budget)
-  problems = fingerprint_problems(s.car_model, CP, fingerprint, replay)
+  replay = build_replay(s, CP, fingerprint, msgs, budget)
+  problems = fingerprint_problems(s.car_model, CP, replay)
   problems += [f"lane budget: {p}" for p in over_budget(replay, budget)]
   problems += radar_problems(CP, window_frames(msgs, s.window), replay)
   return problems
