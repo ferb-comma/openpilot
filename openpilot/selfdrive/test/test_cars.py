@@ -34,6 +34,8 @@ class DriveResult:
   failures: list[str] | None = None
   stats: str = ""
   took: float = 0.
+  # seconds from manager start to onroad
+  onroad: float | None = None
 
   @property
   def name(self) -> str:
@@ -52,10 +54,15 @@ class DriveResult:
     selector = f"{s.car_model}:{s.param}" if self.shared_model else s.car_model
     return f"repeat: SCENARIOS={selector} ./openpilot/selfdrive/test/test_cars.py   (commit {commit()})"
 
+  @property
+  def times(self) -> str:
+    onroad = f"onroad {self.onroad:.0f} s, " if self.onroad is not None else ""
+    return f"{onroad}{self.took:.0f} s"
+
   def line(self) -> str:
     if self.status == "passed":
-      return f"✅ {self.name}  {self.stats}  {self.took:.0f} s"
-    return f"❌ {self.name}  {self.first_failure}  {self.took:.0f} s"
+      return f"✅ {self.name}  {self.stats}  {self.times}"
+    return f"❌ {self.name}  {self.first_failure}  {self.times}"
 
 
 # every car's engaged route window on a DUT in an ultimate provisioning (UP) station, the UP plays the car.
@@ -111,9 +118,10 @@ class TestCars(OpenpilotTestCase):
     try:
       CP, msgs = load_scenario(s)
       frames = build_replay(s, CP, msgs, BUDGET)
-      msgs = drive.run(s, frames)
-      result.failures = rule_failures(msgs, s.mode, s.param, warmup=LENGTH)
-      result.stats = summary(msgs, warmup=LENGTH)
+      log = drive.run(s, frames)
+      result.onroad = log.onroad
+      result.failures = rule_failures(log.msgs, s.mode, s.param, warmup=LENGTH)
+      result.stats = summary(log.msgs, warmup=LENGTH)
       result.status = "passed" if not result.failures else "failed"
     except RigProblem as e:
       result.status = RIG_PROBLEM

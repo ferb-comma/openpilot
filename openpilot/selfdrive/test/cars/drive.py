@@ -3,6 +3,7 @@ import os
 import signal
 import subprocess
 import time
+from dataclasses import dataclass
 
 import openpilot.cereal.messaging as messaging
 from openpilot.common.basedir import BASEDIR
@@ -12,7 +13,8 @@ from openpilot.selfdrive.test.cars.replay import DT, Frame
 from openpilot.selfdrive.test.cars.rules import NO_CAR_MODES, log_line
 from openpilot.selfdrive.test.cars.scenario import LENGTH, Scenario
 
-ONROAD_LIMIT = 120.
+# seconds from manager start, ~2x the measured normal onroad time (20-25 s)
+ONROAD_LIMIT = 45.
 # a warmup loop, then one full loop of the window, the rules judge the second
 RECORD_TIME = 2 * LENGTH
 RECORD = ('can', 'sendcan', 'pandaStates', 'selfdriveState', 'carState', 'onroadEvents', 'managerState', 'errorLogMessage')
@@ -26,6 +28,13 @@ class RigProblem(Exception):
 
 class DriveFailed(Exception):
   pass
+
+
+@dataclass
+class DriveLog:
+  msgs: list
+  # seconds from manager start to onroad
+  onroad: float
 
 
 def onroad_missing(sm) -> list[str]:
@@ -66,6 +75,7 @@ class Drive:
     self.up = up
     self.log_dir = log_dir
     self._manager: subprocess.Popen | None = None
+    self._started = 0.
 
   def _up(self, call: str, *args):
     # the UP not answering is the rack's problem
@@ -90,6 +100,7 @@ class Drive:
       'BLOCK': 'soundd',
     }
     # its own process group, so stopping it leaves no processes for the next scenario
+    self._started = time.monotonic()
     with open(self.log_path(scenario), "w") as log:
       self._manager = subprocess.Popen(["python", os.path.join(BASEDIR, "openpilot/system/manager/manager.py")], env=env, start_new_session=True,
                                        stdout=log, stderr=subprocess.STDOUT)
@@ -124,12 +135,12 @@ class Drive:
       sm.update(10)
     return sm['pandaStates'][0]
 
-  def _wait_onroad(self, sm, can_sock, error_sock, buses: set[int]) -> None:
+  def _wait_onroad(self, sm, can_sock, error_sock, buses: set[int]) -> float:
     seen: set[int] = set()
     # the last error any process logged, and the last card logged
     last_error = ""
     card_error = ""
-    end = time.monotonic() + ONROAD_LIMIT
+    end = self._started + ONROAD_LIMIT
     while True:
       self._check_manager()
       sm.update(10)
@@ -143,12 +154,12 @@ class Drive:
       if buses - seen:
         missing.append(f"no CAN on bus {sorted(buses - seen)}")
       if not missing:
-        return
+        return time.monotonic() - self._started
       if time.monotonic() > end:
         error = card_error or last_error
         if error:
           missing.append(f"last error {error}")
-        raise DriveFailed(f"not onroad after {ONROAD_LIMIT:g} s: {', '.join(missing)}")
+        raise DriveFailed(f"not onroad {ONROAD_LIMIT:g} s after manager start: {', '.join(missing)}")
 
   def _record(self) -> list:
     socks = [messaging.sub_sock(s, conflate=False) for s in RECORD]
@@ -166,7 +177,7 @@ class Drive:
     self._check_manager()
     return msgs
 
-  def run(self, scenario: Scenario, frames: list[Frame]) -> list:
+  def run(self, scenario: Scenario, frames: list[Frame]) -> DriveLog:
     # the UP loops the window from its call until reset, each loop a lead-in, the engage edge, the engaged stretch and the wrap
     buses = {bus for frame in frames for _, _, bus in frame}
     sm = messaging.SubMaster(['deviceState', 'carState', 'managerState', 'pandaStates'])
@@ -182,8 +193,8 @@ class Drive:
       for bus in fd_buses(frames):
         self._up('set_can_data_speed_kbps', bus, can_states[bus].canDataSpeed)
       self._up('can_replay', frames)
-      self._wait_onroad(sm, can_sock, error_sock, buses)
-      return self._record()
+      onroad = self._wait_onroad(sm, can_sock, error_sock, buses)
+      return DriveLog(self._record(), onroad)
     finally:
       try:
         self._up('reset')
