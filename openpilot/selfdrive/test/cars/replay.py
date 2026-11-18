@@ -20,6 +20,8 @@ DT = 0.01
 Frame = list[tuple[int, bytes, int]]
 # frames/s of a station's lanes for buses 0-2, measured on AGNOS 20.1
 BUDGET = {0: 230., 1: 130., 2: 60.}
+# a signal changing at most once per this many seconds on average is a button, flag or state, not a continuous value
+EVENT_PERIOD = 1.
 
 
 def _bytes(msg) -> bytes:
@@ -145,6 +147,35 @@ def _full_rate(dbcs: dict[tuple[int, int], str], parsed: dict[str, DBC], rx_chec
   return rx_checks[key] and not any(_is_counter(sig) for sig in msg.sigs.values())
 
 
+def value_changes(frames: list[Frame], dbcs: dict[tuple[int, int], str], parsed: dict[str, DBC],
+                  full: set[tuple[int, int]]) -> dict[tuple[int, int], set[int]]:
+  # (bus, addr) -> the numbers of its frames where a signal that rarely changes (a button, flag or state) changes,
+  # thinning keeps them so a short press or state change survives. a signal changing more often is a continuous value
+  at: dict[tuple[int, int, str], list[int]] = {}
+  previous: dict[tuple[int, int], dict[str, float]] = {}
+  seen: Counter[tuple[int, int]] = Counter()
+  for frame in frames:
+    for addr, dat, bus in frame:
+      key = (bus, addr)
+      n = seen[key]
+      seen[key] += 1
+      dbc = dbcs.get(key)
+      if dbc is None or key in full:
+        continue
+      values = _values(parsed[dbc].addr_to_msg[addr], dat)
+      if n:
+        for name, value in values.items():
+          if value != previous[key][name]:
+            at.setdefault((bus, addr, name), []).append(n)
+      previous[key] = values
+  rare = len(frames) * DT / EVENT_PERIOD
+  changes: dict[tuple[int, int], set[int]] = {}
+  for (bus, addr, _), ns in at.items():
+    if len(ns) <= rare:
+      changes.setdefault((bus, addr), set()).update(ns)
+  return changes
+
+
 def thin(CP: structs.CarParams, rx_checks: dict[tuple[int, int], bool], frames: list[Frame], budget: dict[int, float],
          keep_all: set[tuple[int, int]] | None = None) -> list[Frame]:
   # keep_all: messages that keep every frame they have
@@ -154,16 +185,17 @@ def thin(CP: structs.CarParams, rx_checks: dict[tuple[int, int], bool], frames: 
   radar_trigger = _radar_trigger(CP)
   counts = Counter((bus, addr) for f in frames for addr, _, bus in f)
   full = {key for key in counts if key in (keep_all or set()) or _full_rate(dbcs, parsed, rx_checks, radar_trigger, key)}
+  changes = value_changes(frames, dbcs, parsed, full)
   # every k-th frame of each other message on a bus, in what the full rate messages leave of the budget
   keep = {}
   for bus, rate in budget.items():
     fixed = sum(n for key, n in counts.items() if key[0] == bus and key in full)
-    rest = [n for key, n in counts.items() if key[0] == bus and key not in full]
+    rest = [key for key in counts if key[0] == bus and key not in full]
     if not rest:
       continue
-    # each message keeps its first frame and every k-th after it
+    # each message keeps its first frame, every k-th after it and every frame whose values change
     k = 1
-    while k < len(frames) and fixed + sum(math.ceil(n / k) for n in rest) > rate * seconds:
+    while k < len(frames) and fixed + sum(math.ceil(counts[key] / k) + sum(1 for n in changes.get(key, ()) if n % k) for key in rest) > rate * seconds:
       k += 1
     keep[bus] = k
   # one packer per bus and DBC, so each bus continues its own counters
@@ -178,7 +210,7 @@ def thin(CP: structs.CarParams, rx_checks: dict[tuple[int, int], bool], frames: 
       k = 1 if (bus, addr) in full else keep.get(bus, 1)
       dbc = dbcs.get((bus, addr))
       msg = parsed[dbc].addr_to_msg[addr] if dbc is not None else None
-      if n % k:
+      if n % k and n not in changes.get((bus, addr), ()):
         continue
       # a kept frame skips k - 1 counter steps, repack it so the counter and checksum stay consecutive
       if k > 1 and msg is not None and dbc is not None and _checked(msg):
