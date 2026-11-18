@@ -40,16 +40,21 @@ class Scenario:
   rise: float
   # (bus, addr) of every message the panda checks -> whether it checks its counter, read when the list is built
   rx_checks: dict[tuple[int, int], bool]
+  # the longest run of empty sendcan the car's controller has while engaged in the route, its command cadence
+  max_idle: int
+
+
+def _first_can(msgs: list) -> int | None:
+  for m in msgs:
+    if m.which() == 'can':
+      return m.logMonoTime
+  return None
 
 
 def engaged_samples(msgs: Iterable) -> list[tuple[float, bool]]:
   samples = []
-  first = None
   msgs = list(msgs)
-  for m in msgs:
-    if m.which() == 'can':
-      first = m.logMonoTime
-      break
+  first = _first_can(msgs)
   if first is None:
     return []
   for m in msgs:
@@ -62,6 +67,35 @@ def engaged_samples(msgs: Iterable) -> list[tuple[float, bool]]:
       continue
     samples.append(((m.logMonoTime - first) / 1e9, bool(allowed)))
   return samples
+
+
+def sendcan_samples(msgs: list) -> list[tuple[float, bool]]:
+  # each logged sendcan and whether it carries a command, in the time base of engaged_samples
+  first = _first_can(msgs)
+  if first is None:
+    return []
+  return [((m.logMonoTime - first) / 1e9, len(m.sendcan) > 0) for m in msgs if m.which() == 'sendcan']
+
+
+def max_idle(sendcan: list[tuple[float, bool]], samples: list[tuple[float, bool]], window: Window, rise: float) -> int | None:
+  # the longest run of empty sendcan between two commands in the window's engaged stretch, None without two commands
+  stop = window.end
+  for t, allowed in samples:
+    if t > rise and not allowed:
+      stop = min(stop, t)
+      break
+  longest = None
+  run = None
+  for t, sent in sendcan:
+    if t < rise or t > stop:
+      continue
+    if sent:
+      if run is not None:
+        longest = max(longest or 0, run)
+      run = 0
+    elif run is not None:
+      run += 1
+  return longest
 
 
 def can_span(msgs: Iterable) -> float:
@@ -161,11 +195,14 @@ def load_route(route: CarTestRoute) -> tuple[int, tuple[structs.CarParams, struc
   raise OSError("; ".join(errors))
 
 
-def read_route(route: CarTestRoute) -> tuple[int, tuple[int, int], tuple[int, int], bool, float, list[tuple[float, bool]]] | Exception:
+RouteData = tuple[int, tuple[int, int], tuple[int, int], bool, float, list[tuple[float, bool]], list[tuple[float, bool]]]
+
+
+def read_route(route: CarTestRoute) -> RouteData | Exception:
   # the picklable part of a route's load, run in a worker, a failure comes back as the exception
   try:
     segment, (CP, dut_CP), msgs = load_route(route)
-    return segment, safety_pair(CP), safety_pair(dut_CP), dut_CP.dashcamOnly, can_span(msgs), engaged_samples(msgs)
+    return segment, safety_pair(CP), safety_pair(dut_CP), dut_CP.dashcamOnly, can_span(msgs), engaged_samples(msgs), sendcan_samples(msgs)
   except Exception as e:
     return e
 
@@ -180,6 +217,8 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
   needs_fw: dict[tuple[int, int], tuple[int, int]] = {}
   # pairs whose DUT car params are dashcamOnly without firmware
   dashcam_only: set[tuple[int, int]] = set()
+  # pairs with an engaged window whose route logged no commands in it
+  no_commands: set[tuple[int, int]] = set()
   gaps = []
   with ProcessPoolExecutor(os.cpu_count(), mp_context=multiprocessing.get_context("spawn")) as pool:
     loaded = list(pool.map(read_route, routes))
@@ -189,7 +228,7 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
       gaps.append(f"{who}: can't load ({result})")
       continue
 
-    segment, mode_param, dut_pair, dut_dashcam, span, samples = result
+    segment, mode_param, dut_pair, dut_dashcam, span, samples, sendcan = result
     if span < LENGTH:
       gaps.append(f"{who}: segment shorter than {LENGTH:g} s")
       continue
@@ -212,7 +251,11 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
     picked = pick_window(samples, span)
     if picked is not None:
       window, rise = picked
-      scenario = Scenario(route.route, segment, str(route.car_model), mode_param[0], mode_param[1], window, rise, checks)
+      idle = max_idle(sendcan, samples, window, rise)
+      if idle is None:
+        no_commands.add(mode_param)
+        continue
+      scenario = Scenario(route.route, segment, str(route.car_model), mode_param[0], mode_param[1], window, rise, checks, idle)
       scenarios.setdefault(mode_param, []).append(scenario)
     elif pick_window(samples, span, lead_in=False) is not None:
       no_lead_in.add(mode_param)
@@ -224,6 +267,8 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
       gaps.append(f"mode {mode} param {param}: param depends on firmware: {needs_fw[(mode, param)]} != {(mode, param)}")
     elif (mode, param) in dashcam_only:
       gaps.append(f"mode {mode} param {param}: dashcam only without firmware")
+    elif (mode, param) in no_commands:
+      gaps.append(f"mode {mode} param {param}: no logged commands in the engaged window")
     elif (mode, param) in no_lead_in:
       gaps.append(f"mode {mode} param {param}: no {LEAD:g} s disengaged lead-in before the engage edge")
     elif (mode, param) in engaged_from_start:

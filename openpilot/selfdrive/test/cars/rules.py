@@ -231,29 +231,36 @@ def _controls_allowed_dropped(rec: Recording) -> list[tuple[float, str]]:
   return failures
 
 
-def _commands_stopped(rec: Recording) -> list[tuple[float, str]]:
+def _commands_stopped(rec: Recording, max_idle: int) -> list[tuple[float, str]]:
+  # card publishes sendcan every cycle, empty on the cycles the car's controller sends nothing,
+  # so commands stopped is a run of more empty sendcan than the car's longest in its route
   failures = []
-  sendcan_idx = [i for i, msg in enumerate(rec.msgs) if msg.which() == 'sendcan' and len(msg.sendcan) > 0]
+  sendcan = [i for i, msg in enumerate(rec.msgs) if msg.which() == 'sendcan']
   for first, last in rec.spans():
     if rec.t(rec.sd_idx[first]) < 0.:
       continue
-    # card starts sending a cycle after openpilot enables, so only a gap after the first command counts
-    started = bisect.bisect_right(sendcan_idx, rec.sd_idx[first])
-    started_idx = sendcan_idx[started] if started < len(sendcan_idx) else None
-    if started_idx is not None and started_idx > rec.sd_idx[last]:
-      started_idx = None
-    for pos in range(first + 1, last + 1):
-      lo = rec.sd_idx[pos - 1]
-      hi = rec.sd_idx[pos]
-      if not rec.stays_enabled(hi):
+    # card starts sending a cycle after openpilot enables, so only a run after the first command counts
+    in_span = [i for i in sendcan if rec.sd_idx[first] < i < rec.sd_idx[last]]
+    started = next((n for n, i in enumerate(in_span) if len(rec.msgs[i].sendcan) > 0), None)
+    if started is None:
+      for pos in range(first + 1, last + 1):
+        if rec.stays_enabled(rec.sd_idx[pos]):
+          t = rec.t(rec.sd_idx[pos])
+          failures.append((t, f"t={t:.2f} no commands while engaged"))
+          break
+      continue
+    run = 0
+    for i in in_span[started:]:
+      if len(rec.msgs[i].sendcan) > 0:
+        run = 0
         continue
-      t = rec.t(hi)
-      if started_idx is None:
-        failures.append((t, f"t={t:.2f} no commands while engaged"))
-        break
+      run += 1
+      if run <= max_idle:
+        continue
       # at a disengage card stops one step before selfdriveState reports it
-      stopped = bisect.bisect_left(sendcan_idx, hi) - bisect.bisect_right(sendcan_idx, lo) == 0
-      if stopped and hi > started_idx:
+      pos = rec.next_sd(i)
+      if pos is not None and rec.stays_enabled(rec.sd_idx[pos]):
+        t = rec.t(rec.sd_idx[pos])
         failures.append((t, f"t={t:.2f} commands stopped while engaged"))
         break
   return failures
@@ -288,13 +295,13 @@ def _faults(rec: Recording) -> list[tuple[float, str]]:
   return failures
 
 
-def rule_failures(msgs: list, mode: int, param: int, start: int | None = None) -> list[str]:
+def rule_failures(msgs: list, mode: int, param: int, max_idle: int, start: int | None = None) -> list[str]:
   rec = _load(msgs, start)
   failures = []
   failures += _not_engaged(rec)
   failures += _blocked_while_engaged(rec)
   failures += _controls_allowed_dropped(rec)
-  failures += _commands_stopped(rec)
+  failures += _commands_stopped(rec, max_idle)
   failures += _safety_pair(rec, mode, param)
   failures += _faults(rec)
   return [line for _, line in sorted(failures, key=lambda f: f[0])]

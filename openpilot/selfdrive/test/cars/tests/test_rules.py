@@ -62,8 +62,29 @@ def clean_drive(duration=5.):
   return msgs
 
 
-def failures(msgs):
-  return rule_failures(msgs, TOYOTA, 0)
+def idle(msgs, since=0., until=float('inf')):
+  # card's commands in [since, until) replaced by empty sendcan, as card publishes on a cycle with nothing to send
+  out = []
+  for m in msgs:
+    if m.which() == 'sendcan' and since <= m.logMonoTime / 1e9 < until:
+      m = can_msg('sendcan', m.logMonoTime / 1e9, [])
+    out.append(m)
+  return out
+
+
+def cadence_drive(every, duration=3.):
+  # openpilot enabled at 1.5 s, card publishes sendcan each 10 ms cycle with a command every `every` cycles
+  msgs = [panda_state(0., False), selfdrive_state(0., False), panda_state(1., True), selfdrive_state(1.5, True)]
+  for i in range(int(duration / 0.01)):
+    t = 2. + i * 0.01
+    frames = [(0x100, 0)] if i % every == 0 else []
+    msgs.append(can_msg('sendcan', t, frames))
+    msgs.append(selfdrive_state(t + 0.005, True))
+  return msgs
+
+
+def failures(msgs, max_idle=0):
+  return rule_failures(msgs, TOYOTA, 0, max_idle)
 
 
 class TestRules(unittest.TestCase):
@@ -112,7 +133,7 @@ class TestRules(unittest.TestCase):
     msgs = [error_log(1., {'msg': {'event': 'commIssue', 'invalid': ['carState'], 'not_alive': [], 'not_freq_ok': []}})]
     msgs += [panda_state(5., False), selfdrive_state(5., False), onroad_events(5.5, 'commIssue', noEntry=True)]
     msgs += [panda_state(6., True), selfdrive_state(8.5, False)]
-    result = rule_failures(msgs, TOYOTA, 0, start=int(5e9))
+    result = rule_failures(msgs, TOYOTA, 0, 0, start=int(5e9))
     assert len(result) == 1
     assert result[0].endswith("commIssue: invalid [carState], not alive []")
 
@@ -134,7 +155,7 @@ class TestRules(unittest.TestCase):
     # openpilot doesn't engage on either edge, only the one after the recording window's start is judged
     msgs = [panda_state(0., False), selfdrive_state(0., False), panda_state(1., True), panda_state(2., False)]
     msgs += [panda_state(5., True), selfdrive_state(7.5, False)]
-    result = rule_failures(msgs, TOYOTA, 0, start=int(4e9))
+    result = rule_failures(msgs, TOYOTA, 0, 0, start=int(4e9))
     assert len(result) == 1
     assert result[0].startswith("t=1.00 not engaged")
 
@@ -146,19 +167,19 @@ class TestRules(unittest.TestCase):
     assert "blocked while engaged" in result[0]
 
   def test_commands_stop(self):
-    msgs = [m for m in clean_drive(8.) if not (m.which() == 'sendcan' and m.logMonoTime >= 5e9)]
-    result = failures(msgs)
+    result = failures(idle(clean_drive(8.), since=5.))
     assert len(result) == 1
     assert "commands stopped" in result[0]
 
   def test_commands_stop_before_disengage(self):
     msgs = clean_drive(3.)
-    msgs += [selfdrive_state(5.02, True), selfdrive_state(6.02, False)]
+    msgs += [can_msg('sendcan', 5., []), selfdrive_state(5.02, True), can_msg('sendcan', 6., []), selfdrive_state(6.02, False)]
     assert failures(msgs) == []
 
   def test_commands_stop_stays_engaged(self):
     msgs = clean_drive(3.)
-    msgs += [selfdrive_state(5.02 + i, True) for i in range(3)]
+    for i in range(3):
+      msgs += [can_msg('sendcan', 5. + i, []), selfdrive_state(5.02 + i, True)]
     msgs.append(selfdrive_state(8.02, False))
     result = failures(msgs)
     assert len(result) == 1
@@ -166,7 +187,7 @@ class TestRules(unittest.TestCase):
 
   def test_commands_start_late(self):
     # no command in the first two samples of the span
-    msgs = [m for m in clean_drive(6.) if not (m.which() == 'sendcan' and m.logMonoTime < 3e9)]
+    msgs = idle(clean_drive(6.), until=3.)
     msgs.append(selfdrive_state(2.02, True))
     assert failures(msgs) == []
 
@@ -176,11 +197,29 @@ class TestRules(unittest.TestCase):
     assert len(result) == 1
     assert "no commands while engaged" in result[0]
 
+  def test_commands_never_start_empty(self):
+    result = failures(idle(clean_drive(6.)))
+    assert len(result) == 1
+    assert "no commands while engaged" in result[0]
+
   def test_commands_start_then_stop(self):
-    msgs = [m for m in clean_drive(8.) if not (m.which() == 'sendcan' and m.logMonoTime >= 5e9)]
-    result = failures(msgs)
+    result = failures(idle(clean_drive(8.), since=5.))
     assert len(result) == 1
     assert "commands stopped while engaged" in result[0]
+
+  def test_commands_50hz_cadence(self):
+    # every other sendcan is empty, the car's cadence in its route
+    assert failures(cadence_drive(2), max_idle=1) == []
+
+  def test_commands_50hz_cadence_at_100hz(self):
+    result = failures(cadence_drive(2), max_idle=0)
+    assert len(result) == 1
+    assert "commands stopped while engaged" in result[0]
+
+  def test_commands_50hz_cadence_stop(self):
+    result = failures(idle(cadence_drive(2, 4.), since=3.), max_idle=1)
+    assert len(result) == 1
+    assert result[0].startswith("t=3.00 commands stopped while engaged")
 
 
 if __name__ == "__main__":

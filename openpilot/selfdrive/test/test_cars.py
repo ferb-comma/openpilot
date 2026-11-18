@@ -152,7 +152,7 @@ class TestCars(OpenpilotTestCase):
       log = drive.run(s, replay.result())
       result.onroad = log.onroad
       result.recorded = log.length
-      result.failures = rule_failures(log.msgs, s.mode, s.param, start=log.start)
+      result.failures = rule_failures(log.msgs, s.mode, s.param, s.max_idle, start=log.start)
       result.stats = summary(log.msgs, start=log.start)
       result.status = "passed" if not result.failures else "failed"
     except RigProblem as e:
