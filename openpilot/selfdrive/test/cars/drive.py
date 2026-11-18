@@ -20,7 +20,7 @@ ONROAD_LIMIT = 45.
 ENGAGED_RECORD = 10.
 # subscribed this long before the recording window, so the states before its start are known
 PREROLL = 0.5
-RECORD = ('can', 'sendcan', 'pandaStates', 'selfdriveState', 'carState', 'onroadEvents', 'managerState', 'errorLogMessage')
+RECORD = ('can', 'sendcan', 'pandaStates', 'selfdriveState', 'carState', 'onroadEvents', 'managerState')
 # the panda marks its own tx echoes with src + 128
 ECHO = 128
 
@@ -141,7 +141,7 @@ class Drive:
       sm.update(10)
     return sm['pandaStates'][0]
 
-  def _wait_onroad(self, sm, can_sock, error_sock, buses: set[int]) -> float:
+  def _wait_onroad(self, sm, can_sock, error_sock, errors: list, buses: set[int]) -> float:
     seen: set[int] = set()
     # the last error any process logged, and the last card logged
     last_error = ""
@@ -153,6 +153,7 @@ class Drive:
       for m in messaging.drain_sock(can_sock):
         seen |= {c.src for c in m.can if c.src < ECHO}
       for m in messaging.drain_sock(error_sock):
+        errors.append(m)
         last_error = log_line(m.errorLogMessage)
         if last_error.startswith("card: "):
           card_error = last_error
@@ -167,9 +168,10 @@ class Drive:
           missing.append(f"last error {error}")
         raise DriveFailed(f"not onroad {ONROAD_LIMIT:g} s after manager start: {', '.join(missing)}")
 
-  def _record(self, start: float, end: float) -> list:
+  def _record(self, start: float, end: float, error_sock, errors: list) -> list:
     while time.monotonic() < start - PREROLL:
       self._check_manager()
+      errors += messaging.drain_sock(error_sock)
       time.sleep(DT)
     socks = [messaging.sub_sock(s, conflate=False) for s in RECORD]
     for sock in socks:
@@ -177,9 +179,11 @@ class Drive:
     msgs = []
     while time.monotonic() < end:
       self._check_manager()
+      errors += messaging.drain_sock(error_sock)
       for sock in socks:
         msgs += messaging.drain_sock(sock)
       time.sleep(DT)
+    errors += messaging.drain_sock(error_sock)
     for sock in socks:
       msgs += messaging.drain_sock(sock)
     self._check_manager()
@@ -190,7 +194,9 @@ class Drive:
     buses = {bus for frame in frames for _, _, bus in frame}
     sm = messaging.SubMaster(['deviceState', 'carState', 'managerState', 'pandaStates'])
     can_sock = messaging.sub_sock('can', conflate=False)
+    # every error since openpilot started, not just the recording window's
     error_sock = messaging.sub_sock('errorLogMessage', conflate=False)
+    errors: list = []
     self._start_manager(scenario)
     try:
       self._up('reset')
@@ -204,11 +210,11 @@ class Drive:
       # the loop's 10 ms clock starts as can_replay returns
       t0 = time.monotonic()
       period = len(frames) * DT
-      onroad = self._wait_onroad(sm, can_sock, error_sock, buses)
+      onroad = self._wait_onroad(sm, can_sock, error_sock, errors, buses)
       # record from the next loop start through its engage edge and the engaged stretch after it
       start = t0 + math.ceil((time.monotonic() - t0) / period) * period
       end = start + (scenario.rise - scenario.window.start) + ENGAGED_RECORD
-      return DriveLog(self._record(start, end), onroad, int(start * 1e9), end - start)
+      return DriveLog(self._record(start, end, error_sock, errors) + errors, onroad, int(start * 1e9), end - start)
     finally:
       try:
         self._up('reset')

@@ -107,6 +107,15 @@ class TestRules(unittest.TestCase):
     assert len(result) == 1
     assert result[0].endswith("commIssue: invalid [carState], not alive [radarState, modelV2]")
 
+  def test_not_engaged_comm_issue_before_window(self):
+    # the commIssue record was logged before the recording window starts
+    msgs = [error_log(1., {'msg': {'event': 'commIssue', 'invalid': ['carState'], 'not_alive': [], 'not_freq_ok': []}})]
+    msgs += [panda_state(5., False), selfdrive_state(5., False), onroad_events(5.5, 'commIssue', noEntry=True)]
+    msgs += [panda_state(6., True), selfdrive_state(8.5, False)]
+    result = rule_failures(msgs, TOYOTA, 0, start=int(5e9))
+    assert len(result) == 1
+    assert result[0].endswith("commIssue: invalid [carState], not alive []")
+
   def test_log_line(self):
     record = {'msg': 'card crashed', 'ctx': {'daemon': 'card'}, 'exc_info': 'Traceback\n  File "card.py"\nKeyError: 1\n'}
     assert log_line(json.dumps(record)) == "card: KeyError: 1"
