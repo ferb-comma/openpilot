@@ -66,6 +66,8 @@ class Scenario:
   # (bus, addr, k) of the messages the replay keeps every k-th frame of instead of thinning them with the rest, so it keeps
   # the signals that engage openpilot and the panda
   kept: tuple[tuple[int, int, int], ...] = ()
+  # how the replay engages against the route's window, from generation
+  fidelity: str = ""
 
 
 def _first_can(msgs: list) -> int | None:

@@ -371,10 +371,15 @@ def faithful_messages(s: Scenario, car: RouteCar, msgs: list, budget: dict[int, 
 
 
 def _cadence(s: Scenario, f: Fidelity | None) -> Scenario:
-  # the route logged an older controller's cadence, the DUT runs the current one, the longer of the two
-  if f is None or f.idle is None:
+  # the route logged an older controller's cadence, the DUT runs the current one, the longer of the two.
+  # and the fidelity line the rack prints
+  if f is None:
     return s
-  return replace(s, max_idle=max(s.max_idle, f.idle))
+  summary = f.summary()
+  if s.kept:
+    summary += f", keeps {', '.join(f'{addr:#x} bus {bus} every {k}' for bus, addr, k in s.kept)} frames"
+  max_idle = s.max_idle if f.idle is None else max(s.max_idle, f.idle)
+  return replace(s, max_idle=max_idle, fidelity=summary)
 
 
 def check_scenario(s: Scenario, car: RouteCar, msgs: list, budget: dict[int, float]) -> tuple[Scenario, list[str]]:

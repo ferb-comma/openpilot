@@ -103,6 +103,8 @@ class DriveResult:
     if self.replay is not None:
       lines.append(self.replay.describe(BUDGET))
       lines.append(self.replay.firmware())
+    if s.fidelity:
+      lines.append(s.fidelity)
     if self.fingerprinted:
       lines.append(self.fingerprinted)
     if self.error:
