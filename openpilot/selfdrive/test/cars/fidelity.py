@@ -3,7 +3,6 @@ import logging
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from functools import partial
 
 from opendbc.can.dbc import DBC
 from opendbc.car import structs
@@ -16,7 +15,7 @@ from openpilot.selfdrive.car.car_events import CarEvents
 from openpilot.selfdrive.car.cruise import V_CRUISE_INITIAL, VCruiseHelper
 from openpilot.selfdrive.selfdrived.events import EVENT_NAME, EVENTS, ET, Events
 from openpilot.selfdrive.selfdrived.state import StateMachine
-from openpilot.selfdrive.test.cars.replay import (DT, Frame, _dbcs, build_replay, fingerprint_problems, needed_frames, over_budget, packets,
+from openpilot.selfdrive.test.cars.replay import (DT, Frame, _dbcs, build_replay, fingerprint_problems, lane_budget, needed_frames, over_budget, packets,
                                                   radar_problems, window_frames)
 from openpilot.selfdrive.test.cars.rules import ENGAGE_LIMIT, signal_values
 from openpilot.selfdrive.test.cars.scenario import MIN_ENGAGED, TAIL, RouteCar, Scenario, Window, build_candidates, first_can
@@ -506,12 +505,12 @@ def _keys(keys) -> str:
   return ", ".join(f"{addr:#x} bus {bus}" for bus, addr in keys)
 
 
-def replay_problems(s: Scenario, car: RouteCar, msgs: list, budget: dict[int, float]) -> tuple[list[str], Fidelity | None]:
+def replay_problems(s: Scenario, car: RouteCar, msgs: list) -> tuple[list[str], Fidelity | None]:
   # what keeps a scenario's replay from playing its car on a station, and its fidelity once the rest plays
   window = window_frames(msgs, s.window)
-  replay = build_replay(s, car, msgs, budget).frames
+  replay = build_replay(s, car, msgs).frames
   problems = fingerprint_problems(car, replay)
-  problems += [f"lane budget: {p}" for p in over_budget(replay, budget)]
+  problems += [f"lane budget: {p}" for p in over_budget(replay, lane_budget(s.lane_share))]
   problems += radar_problems(car.dut_CP, window, replay)
   if problems:
     return problems, None
@@ -519,7 +518,7 @@ def replay_problems(s: Scenario, car: RouteCar, msgs: list, budget: dict[int, fl
   return f.problems, f
 
 
-def faithful_messages(s: Scenario, car: RouteCar, msgs: list, budget: dict[int, float]) -> list[tuple[int, int]] | None:
+def faithful_messages(s: Scenario, car: RouteCar, msgs: list) -> list[tuple[int, int]] | None:
   # the fewest of the messages thinning drops frames of whose every frame makes the replay engage like the route's window,
   # the others thinned as they are, None if all of them every frame doesn't
   CP = car.dut_CP
@@ -529,7 +528,7 @@ def faithful_messages(s: Scenario, car: RouteCar, msgs: list, budget: dict[int, 
   controls = logged_controls(msgs, s.window)
   route_tx = tx_blocks(CP, s.mode, s.param, window, controls) if controls is not None else None
   needed = needed_frames(CP, s.rx_checks, window)
-  replay = build_replay(s, car, msgs, budget).frames
+  replay = build_replay(s, car, msgs).frames
   full = Counter((bus, addr) for frame in needed for addr, _, bus in frame)
   played = Counter((bus, addr) for frame in replay for addr, _, bus in frame)
   # the busiest first, they cost the most budget
@@ -562,13 +561,23 @@ def _cadence(s: Scenario, f: Fidelity | None) -> Scenario:
   return replace(s, max_idle=max_idle, fidelity=summary)
 
 
-def check_scenario(s: Scenario, car: RouteCar, msgs: list, budget: dict[int, float]) -> tuple[Scenario, list[str]]:
+def check_scenario(s: Scenario, car: RouteCar, msgs: list) -> tuple[Scenario, list[str]]:
+  # the scenario in the headroom of each lane, else in the whole lane
+  checked, problems = check_share(s, car, msgs)
+  if problems and s.lane_share < 1.:
+    whole, whole_problems = check_share(replace(s, lane_share=1.), car, msgs)
+    if not whole_problems:
+      return whole, []
+  return checked, problems
+
+
+def check_share(s: Scenario, car: RouteCar, msgs: list) -> tuple[Scenario, list[str]]:
   # the scenario, with the messages its replay keeps more frames of where thinning changes carState, and its problems.
   # changed fields that don't change how the replay engages only cost the scenario if keeping their messages doesn't fit
-  problems, f = replay_problems(s, car, msgs, budget)
+  problems, f = replay_problems(s, car, msgs)
   if f is None or f.window or not (problems or f.fields):
     return _cadence(s, f), problems
-  keys = faithful_messages(s, car, msgs, budget)
+  keys = faithful_messages(s, car, msgs)
   if keys is None:
     if not problems:
       return _cadence(s, f), []
@@ -579,7 +588,7 @@ def check_scenario(s: Scenario, car: RouteCar, msgs: list, budget: dict[int, flo
   plays = None
   for k in range(SLACK + 1, 0, -1):
     kept = replace(s, kept=tuple((bus, addr, k) for bus, addr in keys))
-    kept_problems, kept_f = replay_problems(kept, car, msgs, budget)
+    kept_problems, kept_f = replay_problems(kept, car, msgs)
     if not kept_problems and kept_f is not None and not kept_f.fields:
       return _cadence(kept, kept_f), []
     if not kept_problems and kept_f is not None and plays is None:
@@ -592,7 +601,7 @@ def check_scenario(s: Scenario, car: RouteCar, msgs: list, budget: dict[int, flo
   return s, problems + [f"keeping {_keys(keys)} every {SLACK + 1} frames: {', '.join(first_problems or ['carState still differs'])}"]
 
 
-def pick_scenarios(routes, budget: dict[int, float]) -> tuple[list[Scenario], list[str]]:
+def pick_scenarios(routes) -> tuple[list[Scenario], list[str]]:
   # what a rack run drives: each pair's first scenario whose replay plays on a station, and the gaps
-  candidates, gaps = build_candidates(routes, partial(check_scenario, budget=budget))
+  candidates, gaps = build_candidates(routes, check_scenario)
   return [pair_candidates[0] for pair_candidates in candidates.values()], gaps

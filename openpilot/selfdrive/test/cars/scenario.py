@@ -44,6 +44,9 @@ MAX_LEAD = 15.
 # windows of a segment checked, each lead-in of up to 4 stretches, its first that plays on a station is its scenario
 MAX_CANDIDATES = 4 * len(LEADS)
 SCENARIOS = Path(__file__).parent / "scenarios.json"
+# a lane at its measured rate can drop a frame (a replay at 227 of 230 frames/s lost the one that drops controls),
+# so a replay leaves a tenth of each lane free, a car that doesn't play in that gets the whole lane
+HEADROOM = 0.9
 # each segment's data from a generation, under the version of the code that derived it
 SEGMENT_CACHE = DOWNLOAD_CACHE_ROOT / "cars_segments"
 
@@ -75,6 +78,8 @@ class Scenario:
   kept: tuple[tuple[int, int, int], ...] = ()
   # how the replay engages against the route's window, from generation
   fidelity: str = ""
+  # the share of each lane's measured rate its replay is built for
+  lane_share: float = HEADROOM
 
 
 def first_can(msgs: list) -> int | None:
@@ -588,8 +593,7 @@ def load_scenarios() -> tuple[list[Scenario], list[str]]:
 def main() -> None:
   # fidelity imports this module
   from openpilot.selfdrive.test.cars.fidelity import pick_scenarios
-  from openpilot.selfdrive.test.cars.replay import BUDGET
-  SCENARIOS.write_text(dumps(*pick_scenarios(test_routes, BUDGET)))
+  SCENARIOS.write_text(dumps(*pick_scenarios(test_routes)))
 
 
 if __name__ == "__main__":

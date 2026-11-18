@@ -20,10 +20,6 @@ DT = 0.01
 Frame = list[tuple[int, bytes, int]]
 # frames/s of a station's lanes for buses 0-2, measured on AGNOS 20.1
 LANE_RATES = {0: 230., 1: 130., 2: 60.}
-# a lane at its measured rate can drop a frame (a replay at 227 of 230 frames/s lost the one that drops controls),
-# so a replay leaves a tenth of each lane free
-HEADROOM = 0.9
-BUDGET = {bus: rate * HEADROOM for bus, rate in LANE_RATES.items()}
 # a signal changing at most once per this many seconds on average is a button, flag or state, not a continuous value
 EVENT_PERIOD = 1.
 
@@ -390,8 +386,13 @@ def fingerprint_step(frames: list[Frame], key: tuple[int, int]) -> int:
   return max(1, FRAME_FINGERPRINT // gap)
 
 
-def build_replay(s: Scenario, car: RouteCar, msgs: list, budget: dict[int, float]) -> Replay:
+def lane_budget(share: float) -> dict[int, float]:
+  return {bus: rate * share for bus, rate in LANE_RATES.items()}
+
+
+def build_replay(s: Scenario, car: RouteCar, msgs: list) -> Replay:
   CP = car.dut_CP
+  budget = lane_budget(s.lane_share)
   window = window_frames(msgs, s.window)
   needed = needed_frames(CP, s.rx_checks, window)
   steps = {(bus, addr): k for bus, addr, k in s.kept}
@@ -411,7 +412,7 @@ def scenario_replay(s: Scenario) -> Replay:
   # a scenario's replay from its route, built in a worker while the previous car drives
   try:
     car, msgs = load_scenario(s)
-    return build_replay(s, car, msgs, BUDGET)
+    return build_replay(s, car, msgs)
   except Exception as e:
     # the worker pickles exceptions back, and not every exception pickles
     raise RuntimeError(repr(e)) from None

@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from openpilot.common.basedir import BASEDIR
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.test.cars.drive import Drive, DriveFailed, RigProblem
-from openpilot.selfdrive.test.cars.replay import BUDGET, Replay, scenario_replay
+from openpilot.selfdrive.test.cars.replay import Replay, lane_budget, scenario_replay
 from openpilot.selfdrive.test.cars.rules import (SAFETY_MODELS, Check, cadence, failure_lines, fingerprinted, load_libsafety, rig_problem, rule_checks,
                                                  summary)
 from openpilot.selfdrive.test.cars.scenario import DASHCAM_ONLY, Scenario, load_scenarios
@@ -106,7 +106,7 @@ class DriveResult:
     if s.alpha_long:
       lines.append("openpilot longitudinal: AlphaLongitudinalEnabled on, as the route drove")
     if self.replay is not None:
-      lines.append(self.replay.describe(BUDGET))
+      lines.append(self.replay.describe(lane_budget(s.lane_share)))
       lines.append(self.replay.firmware())
     if s.fidelity:
       lines.append(s.fidelity)
