@@ -12,7 +12,7 @@ from openpilot.common.params import Params
 from openpilot.selfdrive.test.helpers import set_params_enabled
 from openpilot.selfdrive.test.cars.replay import DT, Frame, Replay
 from openpilot.selfdrive.test.cars.rules import NO_CAR_MODES, is_event, log_line
-from openpilot.selfdrive.test.cars.scenario import LEAD, TAIL, Scenario
+from openpilot.selfdrive.test.cars.scenario import TAIL, Scenario
 
 # seconds from manager start, ~2x the measured normal onroad time (20-25 s)
 ONROAD_LIMIT = 45.
@@ -60,16 +60,10 @@ def onroad_missing(sm) -> list[str]:
   return missing
 
 
-def lead_in_start(scenario: Scenario) -> float:
-  # seconds from a loop's start to the lead-in before its engage edge, LEAD before the edge or the loop's start
-  edge = scenario.rise - scenario.window.start
-  return edge - min(LEAD, edge)
-
-
-def recorded_loop(scenario: Scenario, t0: float, period: float, onroad: float) -> float:
-  # the start of the first loop of the clock started at t0 whose engage edge has its whole lead-in after onroad,
-  # subscribed PREROLL before the lead-in
-  return t0 + max(0, math.ceil((onroad + PREROLL - t0 - lead_in_start(scenario)) / period)) * period
+def recorded_loop(t0: float, period: float, onroad: float) -> float:
+  # the start of the first loop of the clock started at t0 after onroad, subscribed PREROLL before it. the recording starts
+  # with the loop, the panda's edge on the station may come before the one the route logged at its pandaStates' rate
+  return t0 + max(0, math.ceil((onroad + PREROLL - t0) / period)) * period
 
 
 def fd_buses(frames: list[Frame]) -> list[int]:
@@ -260,15 +254,14 @@ class Drive:
       period = len(frames) * DT
       self.timing['manager start → onroad'] = self._wait_onroad(sm, can_sock, error_sock, errors, buses)
       onroad = time.monotonic()
-      loop = recorded_loop(scenario, t0, period, onroad)
-      start = loop + lead_in_start(scenario)
+      start = recorded_loop(t0, period, onroad)
       self._wait(start - PREROLL, error_sock, errors)
       socks = [messaging.sub_sock(s, conflate=False) for s in RECORD]
       for sock in socks:
         messaging.drain_sock_raw(sock)
       self.timing['wait for lead-in'] = start - onroad
       # through the window's engaged stretch, ending TAIL before the loop wraps
-      end = loop + (scenario.window.end - TAIL - scenario.window.start)
+      end = start + (scenario.window.end - TAIL - scenario.window.start)
       msgs = self._record(socks, end, error_sock, errors)
       self.timing['record'] = time.monotonic() - start
       return DriveLog(msgs + errors, int(start * 1e9))

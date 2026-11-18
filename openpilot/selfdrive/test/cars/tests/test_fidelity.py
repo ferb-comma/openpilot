@@ -3,7 +3,7 @@ import unittest
 from opendbc.car import structs
 from opendbc.car.car_helpers import interfaces
 
-from openpilot.selfdrive.test.cars.fidelity import LOOPS, SLACK, Engage, Fidelity, diverging, engage_problems, extra_blocks, selfdrive
+from openpilot.selfdrive.test.cars.fidelity import LOOPS, PANDA_STATES, SLACK, TICK, Engage, Fidelity, diverging, engage_problems, extra_blocks, selfdrive
 
 ButtonType = structs.CarState.ButtonEvent.Type
 GearShifter = structs.CarState.GearShifter
@@ -97,6 +97,15 @@ class TestEngageProblems(unittest.TestCase):
 
   def test_late_edge(self):
     assert engage_problems(Engage([1200], [1200], [], False, False, None, [], [], []), 15.)[0].startswith("the panda's edge at 12.00 s leaves less than")
+
+  def test_disallowed_before_edge(self):
+    # a pandaStates has to see the panda disallowed before its edge, a heartbeat drop may come a tick later on a station
+    def problems(disallowed: int, heartbeat_drop: bool) -> list[str]:
+      return engage_problems(Engage([500], [500], [], False, False, None, [], [], [], disallowed, heartbeat_drop), 15.)
+    assert problems(PANDA_STATES + SLACK, False) == []
+    assert problems(PANDA_STATES + SLACK - 1, False)[0].startswith("the panda's edge at 5.00 s comes 0.11 s after it drops controls")
+    assert problems(PANDA_STATES + SLACK + TICK - 1, True)[0].startswith("the panda's edge at 5.00 s comes 1.11 s after its heartbeat check")
+    assert problems(PANDA_STATES + SLACK + TICK, True) == []
 
 
 class TestFidelityProblems(unittest.TestCase):

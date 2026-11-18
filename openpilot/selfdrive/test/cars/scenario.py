@@ -24,7 +24,10 @@ from opendbc.safety.tests.libsafety import libsafety_py
 from openpilot.selfdrive.test.cars.rules import ENGAGE_LIMIT
 from openpilot.tools.lib.logreader import LogReader
 
-LEAD = 5.
+# the disengaged lead-ins a window tries before its engage edge, shortest first. the loop runs on from the previous one, so
+# the parsers and the panda's rx checks are warm, it only has to drop controls after the wrap and show them disallowed in
+# a pandaStates before the edge, fidelity checks that on the replay, how soon depends on what drops them in the window
+LEADS = (0.3, 0.5, 1., 2., 3., 5.)
 # the gap of a pair only cars openpilot doesn't support drive, not counted as testable
 DASHCAM_ONLY = "not supported by openpilot (dashcamOnly)"
 # the engaged stretch after the edge the rules judge: the engage limit and then 3 s of commands to check for blocks,
@@ -34,12 +37,12 @@ MAX_ENGAGED = 10.
 # slack after the recording so it ends before the loop wraps
 TAIL = 1.
 # the UP loops the window, so a short one keeps the wait for its next start short
-MIN_LENGTH = LEAD + MIN_ENGAGED + TAIL
+MIN_LENGTH = LEADS[0] + MIN_ENGAGED + TAIL
 # a window starting before the panda's previous disengage starts this long before it, and at most MAX_LEAD before its edge
 DROP_LEAD = 1.
 MAX_LEAD = 15.
-# windows of a segment checked, its first that plays on a station is its scenario
-MAX_CANDIDATES = 4
+# windows of a segment checked, each lead-in of up to 4 stretches, its first that plays on a station is its scenario
+MAX_CANDIDATES = 4 * len(LEADS)
 SCENARIOS = Path(__file__).parent / "scenarios.json"
 # each segment's data from a generation, under the version of the code that derived it
 SEGMENT_CACHE = DOWNLOAD_CACHE_ROOT / "cars_segments"
@@ -160,13 +163,13 @@ def stretches(samples: list[tuple[float, bool]], can_end: float) -> list[tuple[f
 
 
 def pick_window(samples: list[tuple[float, bool]], can_end: float, lead_in: bool = True) -> tuple[Window, float] | None:
-  # the window and its engage edge, the window starts LEAD before the edge with the panda not allowed throughout,
+  # the window and its engage edge, the window starts the shortest lead-in before the edge with the panda not allowed throughout,
   # so the UP's loop of it is a lead-in, the edge, the engaged stretch and the wrap
   # lead_in=False skips the lead-in check, to tell a missing lead-in from a missing stretch
   best = None
   best_len = 0.
   for rise, allowed_before_rise, engaged in stretches(samples, can_end):
-    start = rise - LEAD
+    start = rise - LEADS[0]
     led_in = start >= 0. and allowed_before_rise < start
     if engaged >= MIN_ENGAGED and (led_in or not lead_in) and engaged > best_len:
       best, best_len = (start, rise), engaged
@@ -178,21 +181,22 @@ def pick_window(samples: list[tuple[float, bool]], can_end: float, lead_in: bool
 
 def candidate_windows(samples: list[tuple[float, bool]], can_end: float) -> list[tuple[Window, float]]:
   # every window and its engage edge, in the order they're tried: first the ones with a disengaged lead-in, longest
-  # stretch first, then the ones that start before the panda's previous disengage, so the loop drops controls
-  # the previous loop left allowed before its edge
+  # stretch first and each with its shortest lead-in first, then the ones that start before the panda's previous disengage,
+  # so the loop drops controls the previous loop left allowed before its edge
   led_in = []
   after_drop = []
   for rise, allowed_before_rise, engaged in stretches(samples, can_end):
     if engaged < MIN_ENGAGED:
       continue
     end = rise + engaged + TAIL
-    if rise - LEAD >= 0. and allowed_before_rise < rise - LEAD:
-      led_in.append((engaged, Window(rise - LEAD, end), rise))
-    start = min(rise - LEAD, allowed_before_rise - DROP_LEAD)
+    for lead in LEADS:
+      if rise - lead >= 0. and allowed_before_rise < rise - lead:
+        led_in.append((-engaged, rise, lead, Window(rise - lead, end)))
+    start = min(rise - LEADS[0], allowed_before_rise - DROP_LEAD)
     if start >= 0. and rise - start <= MAX_LEAD:
-      after_drop.append((engaged, Window(start, end), rise))
-  ordered = sorted(led_in, key=lambda c: -c[0]) + sorted(after_drop, key=lambda c: -c[0])
-  return [(window, rise) for _, window, rise in ordered[:MAX_CANDIDATES]]
+      after_drop.append((-engaged, rise, rise - start, Window(start, end)))
+  ordered = sorted(led_in, key=lambda c: c[:3]) + sorted(after_drop, key=lambda c: c[:3])
+  return [(window, rise) for _, rise, _, window in ordered[:MAX_CANDIDATES]]
 
 
 def safety_pair(CP: structs.CarParams) -> tuple[int, int]:
@@ -548,7 +552,7 @@ def build_candidates(routes, check: Check) -> tuple[dict[tuple[int, int], list[S
     elif (mode, param) in no_commands:
       gaps.append(f"mode {mode} param {param}: no logged commands in the engaged window")
     elif (mode, param) in no_lead_in:
-      gaps.append(f"mode {mode} param {param}: no {LEAD:g} s disengaged lead-in before the engage edge")
+      gaps.append(f"mode {mode} param {param}: no {LEADS[0]:g} s disengaged lead-in before the engage edge")
     elif (mode, param) in engaged_from_start:
       gaps.append(f"mode {mode} param {param}: no engage edge in any segment")
     elif (mode, param) in engaged_once:

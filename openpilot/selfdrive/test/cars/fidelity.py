@@ -10,6 +10,7 @@ from opendbc.car.car_helpers import interfaces
 from opendbc.safety.tests.libsafety import libsafety_py
 
 from openpilot.cereal import log
+from openpilot.cereal.services import SERVICE_LIST
 from openpilot.selfdrive.car.car_events import CarEvents
 from openpilot.selfdrive.car.cruise import V_CRUISE_INITIAL, VCruiseHelper
 from openpilot.selfdrive.selfdrived.events import EVENT_NAME, EVENTS, ET, Events
@@ -28,6 +29,8 @@ LOOPS = 2
 TICK = round(1. / DT)
 # frames a carState change may move by on the replay
 SLACK = 2
+# the rules see the panda's edge after a pandaStates of it disallowed, pandad publishes one every this many frames
+PANDA_STATES = round(1. / (SERVICE_LIST['pandaStates'].frequency * DT))
 # the carState fields that block or trigger an enable in card and selfdrived
 FIELDS = (
   'canValid', 'canTimeout', 'gearShifter', 'seatbeltUnlatched', 'doorOpen', 'brakePressed', 'gasPressed', 'regenBraking',
@@ -250,6 +253,10 @@ class Engage:
   enabled: list[bool]
   # openpilot's enabled each frame of every loop
   looped_enabled: list[bool]
+  # frames the panda is disallowed before its first edge, and whether its heartbeat check dropped it, which a station's
+  # panda does up to a tick later as its ticks aren't in phase with the loop
+  disallowed: int | None = None
+  heartbeat_drop: bool = False
 
 
 def engage(CP: structs.CarParams, mode: int, param: int, frames: list[Frame], end: float,
@@ -283,9 +290,15 @@ def engage(CP: structs.CarParams, mode: int, param: int, frames: list[Frame], en
     if since is not None and not allowed[i] and i - since > limit:
       dropped = i - n
       break
+  disallowed = None
+  heartbeat_drop = False
+  if rises:
+    drop = next((i + 1 for i in range(rises[0] - 1, -1, -1) if allowed[i]), 0)
+    disallowed = rises[0] - drop
+    heartbeat_drop = drop % TICK == 0 and not steps[drop].enabled
   looped_enabled = [s.enabled for s in steps]
   return Engage([r - n for r in rises], enabled_at, blocked, allowed[n], carried, dropped, allowed[n:last + 1],
-                looped_enabled[n:last + 1], looped_enabled)
+                looped_enabled[n:last + 1], looped_enabled, disallowed, heartbeat_drop)
 
 
 def engage_problems(e: Engage, end: float) -> list[str]:
@@ -297,6 +310,10 @@ def engage_problems(e: Engage, end: float) -> list[str]:
   problems = []
   if end - e.rises[0] * DT < MIN_ENGAGED:
     problems.append(f"the panda's edge at {e.rises[0] * DT:.2f} s leaves less than {MIN_ENGAGED:g} s engaged")
+  need = PANDA_STATES + SLACK + (TICK if e.heartbeat_drop else 0)
+  if e.disallowed is not None and e.disallowed < need:
+    how = "its heartbeat check drops controls" if e.heartbeat_drop else "it drops controls"
+    problems.append(f"the panda's edge at {e.rises[0] * DT:.2f} s comes {e.disallowed * DT:.2f} s after {how}, less than {need * DT:.2f} s")
   if e.carried:
     problems.append("openpilot stays engaged across the loop's wrap")
   elif e.blocked:
