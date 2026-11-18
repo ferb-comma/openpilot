@@ -12,7 +12,7 @@ from opendbc.car.car_helpers import FRAME_FINGERPRINT, interfaces
 
 from openpilot.selfdrive.pandad import can_capnp_to_list
 from openpilot.selfdrive.test.cars.rules import BUSES
-from openpilot.selfdrive.test.cars.scenario import Fingerprint, RouteCar, Scenario, Window, build_candidates, load_scenario, safety_pair
+from openpilot.selfdrive.test.cars.scenario import Fingerprint, RouteCar, Scenario, Window, load_scenario, safety_pair
 
 # the UP's can_replay frame period
 DT = 0.01
@@ -53,7 +53,7 @@ def _parsers(CP: structs.CarParams) -> list:
   return [car, radar]
 
 
-def _packets(frames: list[Frame]) -> list[tuple[int, list[CanData]]]:
+def packets(frames: list[Frame]) -> list[tuple[int, list[CanData]]]:
   return [(round(i * DT * 1e9), [CanData(a, d, b) for a, d, b in f]) for i, f in enumerate(frames)]
 
 
@@ -63,7 +63,7 @@ def needed_messages(CP: structs.CarParams, rx_checks: dict[tuple[int, int], bool
   carlog = logging.getLogger("carlog")
   level, carlog.level = carlog.level, logging.CRITICAL
   try:
-    for packet in _packets(frames):
+    for packet in packets(frames):
       car.update([packet])
       radar.update([packet])
   finally:
@@ -234,13 +234,13 @@ def over_budget(frames: list[Frame], budget: dict[int, float]) -> list[str]:
 def _radar_output(CP: structs.CarParams, frames: list[Frame]) -> tuple[int, set[str]]:
   # tracks published and the errors raised by the radar interface on the second of two loops, as the UP plays it
   _, radar = _parsers(CP)
-  packets = _packets(frames)
+  played = packets(frames)
   loop = round(len(frames) * DT * 1e9)
-  for t, packet in packets:
+  for t, packet in played:
     radar.update([(t, packet)])
   published = 0
   errors: set[str] = set()
-  for t, packet in packets:
+  for t, packet in played:
     out = radar.update([(t + loop, packet)])
     if out is None:
       continue
@@ -273,11 +273,11 @@ def _differs(car: RouteCar, fingerprint: Fingerprint) -> list[str]:
 def _can_valid(CP: structs.CarParams, frames: list[Frame]) -> bool:
   # carState is canValid throughout the second of two loops, as the UP plays it
   car = interfaces[CP.carFingerprint](CP)
-  packets = _packets(frames)
+  played = packets(frames)
   loop = round(len(frames) * DT * 1e9)
-  for t, packet in packets:
+  for t, packet in played:
     car.update([(t, packet)])
-  return all(car.update([(t + loop, packet)]).canValid for t, packet in packets)
+  return all(car.update([(t + loop, packet)]).canValid for t, packet in played)
 
 
 def _dut_problem(car: RouteCar, fingerprint: Fingerprint, replay: list[Frame]) -> str | None:
@@ -407,40 +407,3 @@ def scenario_replay(s: Scenario) -> Replay:
   except Exception as e:
     # the worker pickles exceptions back, and not every exception pickles
     raise RuntimeError(repr(e)) from None
-
-
-def replay_problems(s: Scenario, car: RouteCar, msgs: list, budget: dict[int, float]) -> list[str]:
-  # what keeps a scenario's replay from playing its car on a station
-  replay = build_replay(s, car, msgs, budget).frames
-  problems = fingerprint_problems(car, replay)
-  problems += [f"lane budget: {p}" for p in over_budget(replay, budget)]
-  problems += radar_problems(car.dut_CP, window_frames(msgs, s.window), replay)
-  return problems
-
-
-def pick_replay(candidates: list[Scenario], budget: dict[int, float]) -> tuple[Scenario, list[str]]:
-  # a pair's scenarios in routes order, the first whose replay plays on a station, or else the last
-  for s in candidates:
-    car, msgs = load_scenario(s)
-    problems = replay_problems(s, car, msgs, budget)
-    if not problems:
-      break
-  return s, problems
-
-
-def pick_scenarios(routes, budget: dict[int, float]) -> tuple[list[Scenario], list[str]]:
-  # what a rack run drives: each pair's scenario after the lane budget fallback, and the gaps
-  candidates, gaps = build_candidates(routes)
-  scenarios = []
-  for pair_candidates in candidates.values():
-    try:
-      s, problems = pick_replay(pair_candidates, budget)
-    except Exception as e:
-      first = pair_candidates[0]
-      gaps.append(f"{first.car_model} {first.route}: {e!r}")
-      continue
-    if problems:
-      gaps.append(f"mode {s.mode} param {s.param}: {', '.join(problems)}")
-    else:
-      scenarios.append(s)
-  return scenarios, gaps

@@ -443,8 +443,9 @@ def load_scenarios() -> tuple[list[Scenario], list[str]]:
 
 
 def main() -> None:
-  # replay imports this module
-  from openpilot.selfdrive.test.cars.replay import BUDGET, pick_scenarios
+  # fidelity imports this module
+  from openpilot.selfdrive.test.cars.fidelity import pick_scenarios
+  from openpilot.selfdrive.test.cars.replay import BUDGET
   SCENARIOS.write_text(dumps(*pick_scenarios(test_routes, BUDGET)))
 
 
