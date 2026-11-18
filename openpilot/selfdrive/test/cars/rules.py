@@ -216,14 +216,17 @@ def _judged_engaged(rec: Recording, i: int) -> bool:
 def _not_engaged(rec: Recording) -> Check:
   failures = []
   evidence = []
-  for edge, delay in _edges(rec):
+  edges = _edges(rec)
+  if not edges:
+    return Check("no controls_allowed edge of the panda to engage on", [(0., "no engage edge in the recording")])
+  for edge, delay in edges:
     if delay is None:
       reasons = _openpilot_reasons(rec, edge + ENGAGE_LIMIT)
       failures.append((edge, f"t={edge:.2f} not engaged within {ENGAGE_LIMIT:.0f}s of controls_allowed: {reasons}"))
       evidence.append(f"not engaged at the panda's controls_allowed edge (t={edge:.2f})")
     else:
       evidence.append(f"engaged at the panda's controls_allowed edge (t={edge:.2f}, {delay:.2f} s after)")
-  return Check("; ".join(evidence) or "no controls_allowed edge of the panda to engage on", failures)
+  return Check("; ".join(evidence), failures)
 
 
 def _blocked_while_engaged(rec: Recording) -> Check:
@@ -320,7 +323,9 @@ def _commands_stopped(rec: Recording, max_idle: int) -> Check:
   if failures:
     return Check(f"commands idle more than the route max of {max_idle} cycles while engaged", failures)
   if not judged:
-    return Check("no engaged span to check the commands of", failures)
+    # after the engage edge failures it explains
+    end = rec.t(len(rec.msgs) - 1) if rec.msgs else 0.
+    return Check("no engaged span to check the commands of", [(end, "never engaged")])
   if longest is None:
     return Check(f"one command while engaged (route max idle {max_idle} cycles)", failures)
   return Check(f"commands never idle more than {longest} cycles (route max {max_idle})", failures)

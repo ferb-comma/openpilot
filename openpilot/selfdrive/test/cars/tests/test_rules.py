@@ -129,9 +129,14 @@ class TestRules(unittest.TestCase):
     msgs = [panda_state(0., False), selfdrive_state(0., False)]
     msgs += [onroad_events(0.5, 'calibrationIncomplete', noEntry=True), panda_state(1., True), selfdrive_state(3.5, False)]
     result = failures(msgs)
-    assert len(result) == 1
+    assert result[1:] == ["never engaged"]
     assert "calibrationIncomplete (noEntry)" in result[0]
     assert "state disabled, engageable False" in result[0]
+
+  def test_no_engage_edge(self):
+    # the panda never allows controls, so openpilot never engages and nothing is judged
+    msgs = [panda_state(0., False), selfdrive_state(0., False), panda_state(5., False), selfdrive_state(5., False)]
+    assert failures(msgs) == ["no engage edge in the recording", "never engaged"]
 
   def test_not_engaged_no_events(self):
     msgs = [panda_state(0., False), selfdrive_state(0., False), panda_state(1., True), selfdrive_state(3.5, False)]
@@ -142,7 +147,7 @@ class TestRules(unittest.TestCase):
     msgs.append(error_log(0.4, {'msg': {'event': 'commIssue', 'invalid': ['carState'], 'not_alive': ['radarState', 'modelV2'], 'not_freq_ok': []}}))
     msgs += [onroad_events(0.5, 'commIssue', noEntry=True, softDisable=True), panda_state(1., True), selfdrive_state(3.5, False)]
     result = failures(msgs)
-    assert len(result) == 1
+    assert result[1:] == ["never engaged"]
     assert result[0].endswith("commIssue: invalid [carState], not alive [radarState, modelV2]")
 
   def test_not_engaged_comm_issue_before_window(self):
@@ -151,7 +156,7 @@ class TestRules(unittest.TestCase):
     msgs += [panda_state(5., False), selfdrive_state(5., False), onroad_events(5.5, 'commIssue', noEntry=True)]
     msgs += [panda_state(6., True), selfdrive_state(8.5, False)]
     result = rule_failures(msgs, TOYOTA, 0, 0, start=int(5e9))
-    assert len(result) == 1
+    assert result[1:] == ["never engaged"]
     assert result[0].endswith("commIssue: invalid [carState], not alive []")
 
   def test_log_line(self):
@@ -173,7 +178,7 @@ class TestRules(unittest.TestCase):
     msgs = [panda_state(0., False), selfdrive_state(0., False), panda_state(1., True), panda_state(2., False)]
     msgs += [panda_state(5., True), selfdrive_state(7.5, False)]
     result = rule_failures(msgs, TOYOTA, 0, 0, start=int(4e9))
-    assert len(result) == 1
+    assert result[1:] == ["never engaged"]
     assert result[0].startswith("t=1.00 not engaged")
 
   def test_blocked_while_engaged(self):
