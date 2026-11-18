@@ -21,6 +21,8 @@ from openpilot.selfdrive.test.cars.rules import ENGAGE_LIMIT
 from openpilot.tools.lib.logreader import LogReader
 
 LEAD = 5.
+# the gap of a pair only cars openpilot doesn't support drive, not counted as testable
+DASHCAM_ONLY = "not supported by openpilot (dashcamOnly)"
 # the engaged stretch after the edge the rules judge: the engage limit and then 3 s of commands to check for blocks,
 # stops and drops, the window takes up to MAX_ENGAGED of a longer one
 MIN_ENGAGED = ENGAGE_LIMIT + 3.
@@ -222,7 +224,7 @@ class RouteCar:
     pair = safety_pair(self.CP)
     dut_pair = safety_pair(self.dut_CP)
     if self.CP.dashcamOnly:
-      return "dashcam only in opendbc"
+      return DASHCAM_ONLY
     if dut_pair == pair and not self.dut_CP.dashcamOnly:
       return ""
     if self.no_fw:
@@ -383,8 +385,10 @@ def build_candidates(routes) -> tuple[dict[tuple[int, int], list[Scenario]], lis
   more = [search_segments(route, tried[route]) for route in searched]
   add([route for route, segments in zip(searched, more, strict=True) if segments], [segments for segments in more if segments])
 
+  # a pair the DUT can drive on some route gaps for that route's reason
+  drivable_pairs = set(drivable.values())
   for mode, param in sorted(seen_pairs - scenarios.keys()):
-    if (mode, param) in dut_gaps:
+    if (mode, param) in dut_gaps and (mode, param) not in drivable_pairs:
       gaps.append(f"mode {mode} param {param}: {dut_gaps[(mode, param)]}")
     elif (mode, param) in no_commands:
       gaps.append(f"mode {mode} param {param}: no logged commands in the engaged window")

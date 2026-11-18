@@ -15,7 +15,7 @@ from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.test.cars.drive import Drive, DriveFailed, RigProblem
 from openpilot.selfdrive.test.cars.replay import BUDGET, Replay, scenario_replay
 from openpilot.selfdrive.test.cars.rules import SAFETY_MODELS, Check, failure_lines, fingerprinted, rule_checks, summary
-from openpilot.selfdrive.test.cars.scenario import Scenario, load_scenarios
+from openpilot.selfdrive.test.cars.scenario import DASHCAM_ONLY, Scenario, load_scenarios
 
 NOT_DRIVEN = "not driven"
 RIG_PROBLEM = "rig problem"
@@ -36,7 +36,10 @@ def gap_report(scenarios: list[Scenario], gaps: list[str]) -> list[str]:
   pair_gaps = [g for g in gaps if g.startswith("mode ")]
   other = [g for g in gaps if not g.startswith("mode ")]
   pairs = {(s.mode, s.param) for s in scenarios}
-  lines = [f"not covered: {len(pair_gaps)} of {len(pairs) + len(pair_gaps)} safety mode/param pairs have no usable route, so no car drives them:"]
+  dashcam_only = sum(g.endswith(DASHCAM_ONLY) for g in pair_gaps)
+  supported = len(pairs) + len(pair_gaps) - dashcam_only
+  header = f"not covered: covered {len(pairs)} of {supported} supported safety mode/param pairs, {dashcam_only} more pairs are dashcam only"
+  lines = [f"{header}. no car drives these:"]
   for gap in pair_gaps:
     mode, rest = re.fullmatch(r"mode (\d+) (.*)", gap).groups()
     lines.append(f"  {SAFETY_MODELS[int(mode)]} {rest}")

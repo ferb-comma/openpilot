@@ -2,7 +2,8 @@ import unittest
 
 from opendbc.car.structs import car
 from opendbc.car.vin import VIN_UNKNOWN
-from openpilot.selfdrive.test.cars.scenario import MAX_ENGAGED, TAIL, Window, cached_fw, pick_window
+from openpilot.selfdrive.test.test_cars import gap_report
+from openpilot.selfdrive.test.cars.scenario import DASHCAM_ONLY, MAX_ENGAGED, TAIL, Window, cached_fw, pick_window
 
 
 def logged(vin: str = "1HGCM82633A004352", fw: int = 1, brand: str = "toyota"):
@@ -43,6 +44,12 @@ class TestPickWindow(unittest.TestCase):
   def test_no_lead_in(self):
     assert pick_window(engaged_between(3., 12.), 30.) is None
     assert pick_window(engaged_between(3., 12.), 30., lead_in=False) is not None
+
+
+class TestGapReport(unittest.TestCase):
+  def test_dashcam_only_not_supported(self):
+    gaps = [f"mode 1 param 0: {DASHCAM_ONLY}", "mode 2 param 1: no engage edge in any segment"]
+    assert gap_report([], gaps)[0].startswith("not covered: covered 0 of 1 supported safety mode/param pairs, 1 more pairs are dashcam only")
 
 
 if __name__ == "__main__":
