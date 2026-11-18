@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 
 from opendbc.car.structs import CarParams
@@ -97,15 +98,26 @@ class TestCars(OpenpilotTestCase):
     drive = Drive(UP.remote(), log_dir)
     start = time.monotonic()
     # builds the next car's replay while this one drives, at the lowest priority so openpilot keeps its cpu
-    pool = ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn"), initializer=os.nice, initargs=(19,))
+    def new_pool() -> ProcessPoolExecutor:
+      return ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn"), initializer=os.nice, initargs=(19,))
+
+    pool = new_pool()
     try:
-      replays = []
-      if cls.results:
-        replays.append(pool.submit(scenario_replay, cls.results[0].scenario))
+      replay = None
       for i, result in enumerate(cls.results):
+        current = replay or pool.submit(scenario_replay, result.scenario)
+        # waits for this build, a worker that died (segfault, oom) breaks the pool and the next build too
+        crash = current.exception()
+        if isinstance(crash, BrokenProcessPool):
+          pool.shutdown(cancel_futures=True)
+          pool = new_pool()
         if i + 1 < len(cls.results):
-          replays.append(pool.submit(scenario_replay, cls.results[i + 1].scenario))
-        cls.drive_one(drive, result, replays[i])
+          replay = pool.submit(scenario_replay, cls.results[i + 1].scenario)
+        if isinstance(crash, BrokenProcessPool):
+          result.status = "failed"
+          result.error = f"replay build crashed: {crash}"
+        else:
+          cls.drive_one(drive, result, current)
         print(result.line(), flush=True)
         if result.status == "failed":
           print(f"    {result.repeat}", flush=True)
