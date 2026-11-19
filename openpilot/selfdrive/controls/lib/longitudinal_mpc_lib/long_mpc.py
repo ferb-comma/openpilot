@@ -311,6 +311,10 @@ class LongitudinalMpc:
       x_traj[0] = x_start
       x_mpc = np.interp(T_IDXS, LEAD_T_IDXS_MODEL, x_traj)
       v_mpc = np.interp(T_IDXS, LEAD_T_IDXS_MODEL, np.clip(v_traj, 0.0, 1e8))
+      if radar_lead.radar:
+        # model is late to predict a hard braking lead, radar measures it
+        x_radar, v_radar = self.extrapolate_lead(x_start, np.clip(v_lead, 0.0, 1e8), np.clip(a_lead, -10., 5.), a_lead_tau)
+        x_mpc, v_mpc = np.minimum(x_mpc, x_radar), np.minimum(v_mpc, v_radar)
     else:
       x_mpc, v_mpc = self.extrapolate_lead(x_start, np.clip(v_lead, 0.0, 1e8), np.clip(a_lead, -10., 5.), a_lead_tau)
 
