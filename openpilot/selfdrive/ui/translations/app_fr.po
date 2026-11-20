@@ -806,3 +806,14 @@ msgstr[1] "il y a {} minutes"
 msgid "✓ SUBSCRIBED"
 msgstr "✓ ABONNÉ"
 
+#: openpilot/selfdrive/ui/layouts/settings/toggles.py
+msgid "Enable the openpilot longitudinal control (alpha) toggle to allow Experimental mode."
+msgstr "Activez l'option de contrôle longitudinal openpilot (alpha) pour autoriser le mode expérimental."
+
+#: openpilot/selfdrive/ui/layouts/settings/toggles.py
+msgid "Experimental Mode"
+msgstr "Mode expérimental"
+
+#: openpilot/selfdrive/ui/layouts/settings/toggles.py
+msgid "Experimental mode is currently unavailable on this car since the car's stock ACC is used for longitudinal control."
+msgstr "Le mode expérimental est actuellement indisponible sur cette voiture car l'ACC d'origine est utilisé pour le contrôle longitudinal."
