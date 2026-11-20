@@ -810,3 +810,15 @@ msgstr[2] "acum {} de minute"
 msgid "✓ SUBSCRIBED"
 msgstr "✓ ABONAT"
 
+
+#: openpilot/selfdrive/ui/layouts/settings/toggles.py
+msgid "Enable the openpilot longitudinal control (alpha) toggle to allow Experimental mode."
+msgstr "Activați comutatorul pentru controlul longitudinal openpilot (alfa) pentru a permite modul experimental."
+
+#: openpilot/selfdrive/ui/layouts/settings/toggles.py
+msgid "Experimental Mode"
+msgstr "Mod experimental"
+
+#: openpilot/selfdrive/ui/layouts/settings/toggles.py
+msgid "Experimental mode is currently unavailable on this car since the car's stock ACC is used for longitudinal control."
+msgstr "Modul experimental nu este disponibil momentan pe această mașină, deoarece pentru controlul longitudinal se folosește ACC-ul original al mașinii."
