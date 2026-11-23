@@ -339,8 +339,8 @@ class SelfdriveD:
       else:
         safety_mismatch = pandaState.safetyModel not in IGNORED_SAFETY_MODES
 
-      # safety mismatch allows some time for pandad to set the safety mode and publish it back from panda
-      if (safety_mismatch and self.sm.frame*DT_CTRL > 10.) or pandaState.safetyRxChecksInvalid or self.mismatch_counter >= 200:
+      # allow some time for pandad to set the safety mode and for the panda to see every message its rx checks need
+      if ((safety_mismatch or pandaState.safetyRxChecksInvalid) and self.sm.frame*DT_CTRL > 10.) or self.mismatch_counter >= 200:
         self.events.add(EventName.controlsMismatch)
 
       if log.PandaState.FaultType.relayMalfunction in pandaState.faults:
