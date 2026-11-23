@@ -82,6 +82,9 @@ LOG_CONFIG_SET_MASK_OP = 3
 LOG_CONFIG_SUCCESS_S = 0
 
 def send_recv(diag, packet_type, packet_payload):
+  # drop anything left over, like the reply to an earlier request that failed, so replies don't fall one behind
+  diag.serial.reset_input_buffer()
+  diag.pend = b''
   diag.send(packet_type, packet_payload)
   while 1:
     opcode, payload = diag.recv()
