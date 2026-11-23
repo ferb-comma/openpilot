@@ -260,7 +260,8 @@ def main() -> None:
   cloudlog.info("radard got CarParams")
 
   # *** setup messaging
-  sm = messaging.SubMaster(['modelV2', 'carState', 'radarTracks'], poll='modelV2')
+  # some radars publish right at the minimum average frequency (Ford's MRR at ~8 Hz), the alive check still catches a dead radar
+  sm = messaging.SubMaster(['modelV2', 'carState', 'radarTracks'], poll='modelV2', ignore_avg_freq=['radarTracks'])
   pm = messaging.PubMaster(['radarState'])
 
   RD = RadarD(CP.radarDelay)
