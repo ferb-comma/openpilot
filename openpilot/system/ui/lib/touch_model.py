@@ -1,88 +1,67 @@
 from collections import deque
+from functools import cache
 import numpy as np
 from openpilot.common.params import Params
 
-TAP_BUFFER_SIZE = 1000  # taps, older ones weigh nothing at this half-life
-TAP_HALF_LIFE = 80  # taps, about half a minute of typing, so a new way of holding the device takes over quickly
-PRIOR_TAPS = 3  # a key trusts its own taps once it has about this many
-CORRECTION_WEIGHT = 2.0  # a backspaced tap retyped as another key says where that key really is
-CORRECTION_MAX_DIST = 70  # px, retyped key must be about one key away from the erased tap, else the user changed their mind
+MAX_TAPS = 1000
+HALF_LIFE = 80  # taps, about half a minute of typing, so a new way of holding the device takes over quickly
+PRIOR_TAPS = 6  # a key trusts its own taps once it has about this many
+CORRECTION_MARGIN = 30  # px, a backspaced tap about as close to the runner-up key as to its own was probably meant for the runner-up
 
 
 class TouchModel:
-  """Learns where this user taps for each key. Taps are stored as [key_x, key_y, touch_x, touch_y, weight]."""
+  """Learns where this user taps each key. Taps are stored as [key_x, key_y, touch_x, touch_y]."""
   def __init__(self):
     self._params = Params()
-    self._taps = deque(self._params.get("KeyboardTouchTaps") or [], maxlen=TAP_BUFFER_SIZE)
+    self._taps = deque(self._params.get("KeyboardTouchTaps") or [], maxlen=MAX_TAPS)
+    self._typed: list = []  # taps in the current text with their runner-up key, for backspace
     self._fit()
-    self.start_session()
-
-  def start_session(self):
-    self._session_taps = 0  # taps typed into the current text, the only ones backspace can take back
-    self._erased: list[list[float]] = []
 
   def target(self, key_x: float, key_y: float) -> tuple[float, float]:
-    return self._targets.get((round(key_x), round(key_y))) or (self._fit_x(key_x), self._fit_y(key_y))
+    return self._targets.get((round(key_x), round(key_y))) or tuple(self._layout_target(np.array([key_x, key_y])))
 
-  def add_tap(self, key_x: float, key_y: float, touch_x: float, touch_y: float):
-    if self._erased:
-      erased = self._erased.pop()
-      if abs(erased[2] - key_x) + abs(erased[3] - key_y) < CORRECTION_MAX_DIST:
-        self._taps.append([round(key_x), round(key_y), erased[2], erased[3], CORRECTION_WEIGHT])
-    self._taps.append([round(key_x), round(key_y), round(touch_x), round(touch_y), 1.0])
-    self._session_taps += 1
+  def add_tap(self, key_pos, touch_pos, runner_up_pos, margin: float):
+    tap = [round(key_pos[0]), round(key_pos[1]), round(touch_pos[0]), round(touch_pos[1])]
+    self._taps.append(tap)
+    self._typed.append((tap, runner_up_pos, margin))
+    self._update()
+
+  def erase_tap(self):
+    if self._typed:
+      tap, runner_up_pos, margin = self._typed.pop()
+      if margin < CORRECTION_MARGIN:
+        tap[:2] = round(runner_up_pos[0]), round(runner_up_pos[1])
+      elif tap in self._taps:
+        self._taps.remove(tap)
+      self._update()
+
+  def clear_typed(self):
+    self._typed = []
+
+  def _update(self):
     self._fit()
     self._params.put("KeyboardTouchTaps", list(self._taps))
 
-  def erase_tap(self):
-    if self._session_taps > 0:
-      self._session_taps -= 1
-      tap = self._taps.pop()
-      while tap[4] != 1.0:  # drop a correction made by the tap being erased along with it
-        tap = self._taps.pop()
-      self._erased.append(tap)
-      self._fit()
-      self._params.put("KeyboardTouchTaps", list(self._taps))
+  def _layout_target(self, key):
+    return key + self._shift + self._stretch * (key - self._center)
 
   def _fit(self):
+    # the whole layout shifts and stretches to fit all taps, then each key moves to the recency weighted mean of its own
+    taps = np.array(self._taps, dtype=float).reshape(-1, 4)
+    w = 0.5 ** (np.arange(len(taps))[::-1, None] / HALF_LIFE)
+    keys, offsets = taps[:, :2], taps[:, 2:] - taps[:, :2]
+    self._center = np.sum(w * keys, axis=0) / max(np.sum(w), 1e-3)
+    self._shift = np.sum(w * offsets, axis=0) / (np.sum(w) + PRIOR_TAPS)
+    rel = keys - self._center
+    self._stretch = np.sum(w * rel * (offsets - self._shift), axis=0) / (np.sum(w * rel ** 2, axis=0) + PRIOR_TAPS * 50 ** 2)
     self._targets = {}
-    self._fit_x = self._fit_y = lambda k: k
-    if not self._taps:
-      return
-
-    taps = np.array(self._taps, dtype=float)
-    weights = taps[:, 4] * 0.5 ** (np.arange(len(taps))[::-1] / TAP_HALF_LIFE)
-
-    # how the whole layout is shifted and stretched, so keys with few taps still move
-    self._fit_x = self._fit_axis(taps[:, 0], taps[:, 2], weights)
-    self._fit_y = self._fit_axis(taps[:, 1], taps[:, 3], weights)
-
-    # each key then moves to the weighted mean of its own taps
-    for key_x, key_y in {(k[0], k[1]) for k in self._taps}:
-      mask = (taps[:, 0] == key_x) & (taps[:, 1] == key_y)
-      w = weights[mask]
-      x = (PRIOR_TAPS * self._fit_x(key_x) + np.sum(w * taps[mask, 2])) / (PRIOR_TAPS + np.sum(w))
-      y = (PRIOR_TAPS * self._fit_y(key_y) + np.sum(w * taps[mask, 3])) / (PRIOR_TAPS + np.sum(w))
-      self._targets[(int(key_x), int(key_y))] = (float(x), float(y))
-
-  @staticmethod
-  def _fit_axis(keys, touches, weights):
-    # weighted line touch = scale * key + offset, pulled towards no change until there are enough taps
-    total = np.sum(weights)
-    key_mean = np.sum(weights * keys) / total
-    touch_mean = np.sum(weights * touches) / total
-    prior = PRIOR_TAPS * 50 ** 2
-    scale = (np.sum(weights * (keys - key_mean) * (touches - touch_mean)) + prior) / (np.sum(weights * (keys - key_mean) ** 2) + prior)
-    shift = (touch_mean - key_mean) * total / (total + PRIOR_TAPS)
-    return lambda k: float(key_mean + shift + scale * (k - key_mean))
+    for key in {(k[0], k[1]) for k in self._taps}:
+      mask = np.all(keys == key, axis=1)
+      target = (PRIOR_TAPS * self._layout_target(np.array(key)) + np.sum(w[mask] * taps[mask, 2:], axis=0)) / (PRIOR_TAPS + np.sum(w[mask]))
+      self._targets[key] = tuple(target)
 
 
-touch_model: TouchModel | None = None
-
-
+@cache
 def get_touch_model() -> TouchModel:
-  # one model shared by every keyboard, so they all learn and save the same taps
-  global touch_model
-  if touch_model is None:
-    touch_model = TouchModel()
-  return touch_model
+  # one model shared by every keyboard
+  return TouchModel()
