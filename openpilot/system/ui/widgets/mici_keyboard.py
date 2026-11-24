@@ -3,6 +3,7 @@ import raylib_nb as rl
 import numpy as np
 from openpilot.system.ui.lib.application import gui_app, FontWeight, MousePos, MouseEvent
 from openpilot.system.ui.lib.text_measure import measure_text_cached
+from openpilot.system.ui.lib.touch_model import get_touch_model
 from openpilot.system.ui.widgets import Widget
 from openpilot.common.filter_simple import BounceFilter, FirstOrderFilter
 
@@ -211,6 +212,8 @@ class MiciKeyboard(Widget):
     self._unselect_key_t: float | None = None  # time to unselect key after release
 
     self._text: str = ""
+    self._touch_model = get_touch_model()
+    self._press_pos: MousePos | None = None
 
     self._bg_scale_filter = BounceFilter(1.0, 0.1 * ANIMATION_SCALE, 1 / gui_app.target_fps)
     self._selected_key_filter = FirstOrderFilter(0.0, 0.075 * ANIMATION_SCALE, 1 / gui_app.target_fps)
@@ -240,6 +243,7 @@ class MiciKeyboard(Widget):
 
   def set_text(self, text: str):
     self._text = text
+    self._touch_model.start_session()
 
   def text(self) -> str:
     return self._text
@@ -257,6 +261,7 @@ class MiciKeyboard(Widget):
         self._selected_key_t = None
         self._unselect_key_t = None
         self._active_slot = mouse_event.slot
+        self._press_pos = MousePos(mouse_event.pos.x, mouse_event.pos.y - self._rect.y)
 
     elif mouse_event.left_released and mouse_event.slot == self._active_slot:
       self._active_slot = None
@@ -280,7 +285,8 @@ class MiciKeyboard(Widget):
       for key in row:
         # approximate distance for comparison is accurate enough
         # use local y coords so parent widget offset (e.g. during NavWidget animate-in) doesn't affect hit testing
-        dist = abs(key.original_position.x - mouse_pos.x) + abs(key.original_position.y - (mouse_pos.y - self._rect.y))
+        target_x, target_y = self._touch_model.target(key.original_position.x, key.original_position.y)
+        dist = abs(target_x - mouse_pos.x) + abs(target_y - (mouse_pos.y - self._rect.y))
         if dist < closest_key[1]:
           if self._closest_key[0] is None or key is self._closest_key[0] or dist < self._closest_key[1] - KEY_DRAG_HYSTERESIS:
             closest_key = (key, dist)
@@ -313,6 +319,10 @@ class MiciKeyboard(Widget):
         self._set_keys(self._super_special_keys)
       else:
         self._text += self._closest_key[0].char
+        # learn where this user taps for the key they typed, from where the finger first came down
+        if self._press_pos is not None:
+          key = self._closest_key[0]
+          self._touch_model.add_tap(key.original_position.x, key.original_position.y, self._press_pos.x, self._press_pos.y)
 
         # Reset caps state
         if self._caps_state == CapsState.UPPER:
@@ -330,6 +340,7 @@ class MiciKeyboard(Widget):
   def backspace(self):
     if self._text:
       self._text = self._text[:-1]
+      self._touch_model.erase_tap()
 
   def space(self):
     self._text += ' '
