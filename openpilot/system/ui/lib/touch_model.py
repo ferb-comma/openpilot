@@ -1,67 +1,30 @@
-from collections import deque
-from functools import cache
 import numpy as np
 from openpilot.common.params import Params
 
-MAX_TAPS = 1000
-HALF_LIFE = 80  # taps, about half a minute of typing, so a new way of holding the device takes over quickly
-PRIOR_TAPS = 6  # a key trusts its own taps once it has about this many
-CORRECTION_MARGIN = 30  # px, a backspaced tap about as close to the runner-up key as to its own was probably meant for the runner-up
+LEARN_RATE = 1 / 20  # taps, about ten seconds of typing to adapt to a new way of holding the device
+# per axis: mean key position, mean touch, mean key * touch, mean key ** 2, starting with taps landing on the keys
+DEFAULT_STATS = [[268, 268, 268 ** 2 + 140 ** 2, 268 ** 2 + 140 ** 2], [165, 165, 165 ** 2 + 42 ** 2, 165 ** 2 + 42 ** 2]]
 
 
 class TouchModel:
-  """Learns where this user taps each key. Taps are stored as [key_x, key_y, touch_x, touch_y]."""
+  """Learns how this user's taps are shifted and stretched from the keys, with running averages per axis."""
   def __init__(self):
     self._params = Params()
-    self._taps = deque(self._params.get("KeyboardTouchTaps") or [], maxlen=MAX_TAPS)
-    self._typed: list = []  # taps in the current text with their runner-up key, for backspace
-    self._fit()
+    self._stats = np.array(self._params.get("KeyboardTouchStats") or DEFAULT_STATS, dtype=float)
+    self._pending = None
 
   def target(self, key_x: float, key_y: float) -> tuple[float, float]:
-    return self._targets.get((round(key_x), round(key_y))) or tuple(self._layout_target(np.array([key_x, key_y])))
+    key_mean, touch_mean, key_touch, key_sq = self._stats.T
+    stretch = (key_touch - key_mean * touch_mean) / (key_sq - key_mean ** 2)
+    return tuple(touch_mean + stretch * (np.array([key_x, key_y]) - key_mean))
 
-  def add_tap(self, key_pos, touch_pos, runner_up_pos, margin: float):
-    tap = [round(key_pos[0]), round(key_pos[1]), round(touch_pos[0]), round(touch_pos[1])]
-    self._taps.append(tap)
-    self._typed.append((tap, runner_up_pos, margin))
-    self._update()
+  def add_tap(self, key_pos, touch_pos):
+    # learn from the previous tap once the next key is typed, so backspaced taps are never learned
+    if self._pending is not None:
+      key, touch = self._pending
+      self._stats += LEARN_RATE * (np.stack([key, touch, key * touch, key ** 2], axis=1) - self._stats)
+      self._params.put("KeyboardTouchStats", self._stats.tolist())
+    self._pending = np.array(key_pos, dtype=float), np.array(touch_pos, dtype=float)
 
   def erase_tap(self):
-    if self._typed:
-      tap, runner_up_pos, margin = self._typed.pop()
-      if margin < CORRECTION_MARGIN:
-        tap[:2] = round(runner_up_pos[0]), round(runner_up_pos[1])
-      elif tap in self._taps:
-        self._taps.remove(tap)
-      self._update()
-
-  def clear_typed(self):
-    self._typed = []
-
-  def _update(self):
-    self._fit()
-    self._params.put("KeyboardTouchTaps", list(self._taps))
-
-  def _layout_target(self, key):
-    return key + self._shift + self._stretch * (key - self._center)
-
-  def _fit(self):
-    # the whole layout shifts and stretches to fit all taps, then each key moves to the recency weighted mean of its own
-    taps = np.array(self._taps, dtype=float).reshape(-1, 4)
-    w = 0.5 ** (np.arange(len(taps))[::-1, None] / HALF_LIFE)
-    keys, offsets = taps[:, :2], taps[:, 2:] - taps[:, :2]
-    self._center = np.sum(w * keys, axis=0) / max(np.sum(w), 1e-3)
-    self._shift = np.sum(w * offsets, axis=0) / (np.sum(w) + PRIOR_TAPS)
-    rel = keys - self._center
-    self._stretch = np.sum(w * rel * (offsets - self._shift), axis=0) / (np.sum(w * rel ** 2, axis=0) + PRIOR_TAPS * 50 ** 2)
-    self._targets = {}
-    for key in {(k[0], k[1]) for k in self._taps}:
-      mask = np.all(keys == key, axis=1)
-      target = (PRIOR_TAPS * self._layout_target(np.array(key)) + np.sum(w[mask] * taps[mask, 2:], axis=0)) / (PRIOR_TAPS + np.sum(w[mask]))
-      self._targets[key] = tuple(target)
-
-
-@cache
-def get_touch_model() -> TouchModel:
-  # one model shared by every keyboard
-  return TouchModel()
+    self._pending = None
