@@ -101,6 +101,8 @@ class SelfdriveD:
     self.is_metric = self.params.get_bool("IsMetric")
     self.is_ldw_enabled = self.params.get_bool("IsLdwEnabled")
     self.disengage_on_accelerator = self.params.get_bool("DisengageOnAccelerator")
+    self.chestnut_loading = self.params.get_bool("ChestnutLoading")
+    self.chestnut_active = self.params.get("ChestnutActive")
     openpilot_enabled = self.params.get_bool("OpenpilotEnabledToggle")
 
     car_recognized = self.CP.brand != 'mock'
@@ -158,14 +160,14 @@ class SelfdriveD:
       self.events.add(EventName.joystickDebug)
       self.startup_event = None
 
-    loading = self.params.get_bool("ChestnutLoading")
+    loading = self.chestnut_loading
     if self.big_model_loading and not loading:
       self.big_model_ready_t = time.monotonic()
     self.big_model_loading = loading
     if self.big_model_loading:
       self.events.add(EventName.bigModelLoading)
 
-    big_active = self.params.get("ChestnutActive")
+    big_active = self.chestnut_active
     chestnut_present = self.sm['deviceState'].chestnutPresent
     model_unavailable = big_active is True and self.sm.seen['modelV2'] and not self.sm.alive['modelV2']
     big_failed = big_active is False or model_unavailable or (self.big_model_active and not chestnut_present)
@@ -569,8 +571,11 @@ class SelfdriveD:
 
     self.CS_prev = CS
 
+  # file reads can block for 100+ ms when the disk is busy, so keep them off the 100 Hz loop
   def params_thread(self, evt):
     while not evt.is_set():
+      self.chestnut_loading = self.params.get_bool("ChestnutLoading")
+      self.chestnut_active = self.params.get("ChestnutActive")
       self.is_metric = self.params.get_bool("IsMetric")
       self.is_ldw_enabled = self.params.get_bool("IsLdwEnabled")
       self.disengage_on_accelerator = self.params.get_bool("DisengageOnAccelerator")
