@@ -336,7 +336,7 @@ class MiciOffroadAlerts(NavScroller):
     update_alert_data = AlertData(key="UpdateAvailable", text="", severity=-1)
     self.sorted_alerts.append(update_alert_data)
     update_alert_item = AlertItem(update_alert_data)
-    update_alert_item.set_click_callback(lambda: HARDWARE.reboot())
+    update_alert_item.set_click_callback(lambda: HARDWARE.reboot() if ui_state.is_offroad() else None)
     self.alert_items.append(update_alert_item)
     self._scroller.add_widget(update_alert_item)
 
