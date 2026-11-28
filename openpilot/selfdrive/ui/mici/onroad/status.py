@@ -29,6 +29,9 @@ class StatusFade:
 
   def _update(self) -> np.ndarray:
     if ui_state.sm.frame != self._frame:
+      # a widget that wasn't drawn (offroad, another screen) starts again from the status now, not from what it last showed
+      if ui_state.sm.frame != self._frame + 1:
+        self._weights.initialized = False
       self._frame = ui_state.sm.frame
       now = rl.get_time()
       if ui_state.status == UIStatus.OVERRIDE:
